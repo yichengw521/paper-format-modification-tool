@@ -120,7 +120,11 @@ public class TaskService {
     }
 
     /** Confirm the selected rules and start the irreversible processing stage. */
-    public synchronized TaskView confirm(String id, List<String> enabledRuleKeys) throws IOException {
+    public synchronized TaskView confirm(
+            String id,
+            List<String> enabledRuleKeys,
+            List<String> acceptedIssueKeys
+    ) throws IOException {
         TaskView current = get(id);
         if (current.status() != TaskStatus.AWAITING_CONFIRMATION) {
             throw new IllegalStateException("Task is not awaiting confirmation: " + current.status());
@@ -135,17 +139,29 @@ public class TaskService {
         if (selected.isEmpty()) {
             throw new IllegalArgumentException("Please select at least one format rule.");
         }
+        LinkedHashSet<String> allowedIssues = new LinkedHashSet<>();
+        if (plan.issues() != null) {
+            for (FormatPlan.Issue issue : plan.issues()) allowedIssues.add(issue.key());
+        }
+        LinkedHashSet<String> accepted = new LinkedHashSet<>();
+        if (acceptedIssueKeys != null) {
+            for (String key : acceptedIssueKeys) if (allowedIssues.contains(key)) accepted.add(key);
+        }
         Path directory = taskDirectory(id);
         objectMapper.writerWithDefaultPrettyPrinter().writeValue(
                 directory.resolve("output").resolve(CONFIRMATION_FILE).toFile(),
-                Map.of("confirmedAt", OffsetDateTime.now(ZoneOffset.UTC).toString(), "enabledRuleKeys", selected));
+                Map.of(
+                        "confirmedAt", OffsetDateTime.now(ZoneOffset.UTC).toString(),
+                        "enabledRuleKeys", selected,
+                        "acceptedIssueKeys", accepted));
         update(id, TaskStatus.QUEUED, null, null, null, null);
         executor.execute(() -> process(
                 id,
                 directory.resolve("input").resolve("template.docx"),
                 directory.resolve("input").resolve("document.docx"),
                 directory.resolve("output"),
-                selected
+                selected,
+                accepted
         ));
         return get(id);
     }
@@ -189,7 +205,14 @@ public class TaskService {
         }
     }
 
-    private void process(String id, Path templatePath, Path documentPath, Path outputDirectory, java.util.Set<String> enabledRuleKeys) {
+    private void process(
+            String id,
+            Path templatePath,
+            Path documentPath,
+            Path outputDirectory,
+            java.util.Set<String> enabledRuleKeys,
+            java.util.Set<String> acceptedIssueKeys
+    ) {
         update(id, TaskStatus.PROCESSING, null, null, null, null);
         try {
             ProcessingReport report = new WordFormatProcessor().process(
@@ -197,7 +220,8 @@ public class TaskService {
                     documentPath,
                     outputDirectory.resolve(RESULT_FILE),
                     outputDirectory.resolve(REPORT_FILE),
-                    enabledRuleKeys
+                    enabledRuleKeys,
+                    acceptedIssueKeys
             );
             update(
                     id,

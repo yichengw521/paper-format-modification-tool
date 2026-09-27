@@ -126,18 +126,19 @@ async function loadPlan() {
 
 async function confirmPlan() {
   const enabledRuleKeys = plan.value?.rules?.filter(rule => rule.enabled).map(rule => rule.key) || []
+  const acceptedIssueKeys = plan.value?.issues?.filter(issue => issue.selected).map(issue => issue.key) || []
   if (!enabledRuleKeys.length) {
     ElMessage.warning('请至少选择一项需要修改的格式')
     return
   }
   try {
     await ElMessageBox.confirm(
-      `确认按已选择的 ${enabledRuleKeys.length} 项规则生成新文档吗？原文件不会被覆盖。`,
+      `确认按 ${enabledRuleKeys.length} 项格式规则处理，并采用 ${acceptedIssueKeys.length} 项章节文字修正吗？原文件不会被覆盖。`,
       '二次确认',
       { confirmButtonText: '确认并执行修改', cancelButtonText: '继续检查', type: 'warning' },
     )
     submitting.value = true
-    const response = await axios.post(task.value.links.confirm, { enabledRuleKeys })
+    const response = await axios.post(task.value.links.confirm, { enabledRuleKeys, acceptedIssueKeys })
     task.value = response.data
     pollTask()
   } catch (error) {
@@ -272,6 +273,24 @@ onBeforeUnmount(stopPolling)
               <span>{{ plan.documentSummary.tables }} 个表格</span>
               <span>{{ plan.documentSummary.sections }} 个分节</span>
             </div>
+          </div>
+
+          <div v-if="plan.issues?.length" class="issue-panel">
+            <div class="issue-heading">
+              <div>
+                <span class="file-kicker">结构问题</span>
+                <h3>请确认章节文字修正</h3>
+              </div>
+              <span>{{ plan.issues.length }} 项待确认</span>
+            </div>
+            <article v-for="issue in plan.issues" :key="issue.key" class="issue-card" :class="{ disabled: !issue.selected }">
+              <el-checkbox v-model="issue.selected" size="large" />
+              <div>
+                <strong>{{ issue.originalText }} <em>→</em> {{ issue.suggestedText }}</strong>
+                <p>{{ issue.reason }}</p>
+                <small>{{ issue.confidence }}% 置信度 · 取消勾选将保留原文</small>
+              </div>
+            </article>
           </div>
 
           <div class="rule-list">

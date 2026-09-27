@@ -12,6 +12,7 @@ public record FormatPlan(
         ProcessingReport.TemplateRules templateRules,
         ProcessingReport.DocumentSummary documentSummary,
         List<Rule> rules,
+        List<Issue> issues,
         List<String> warnings
 ) {
     public record Rule(
@@ -25,6 +26,21 @@ public record FormatPlan(
             String sourceType,
             String evidence,
             int confidence
+    ) {
+    }
+
+    /**
+     * 文档内容结构中需要用户明确确认后才能修正的问题。
+     */
+    public record Issue(
+            String key,
+            String type,
+            int paragraphIndex,
+            String originalText,
+            String suggestedText,
+            String reason,
+            int confidence,
+            boolean selected
     ) {
     }
 }

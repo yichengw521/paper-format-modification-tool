@@ -90,6 +90,18 @@ main { max-width: 1120px; margin: 0 auto; padding: 48px 28px 80px; }
 .confirmation-heading p { max-width: 650px; margin: 0; color: var(--muted); line-height: 1.7; }
 .document-counts { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 7px; }
 .document-counts span { padding: 7px 10px; border-radius: 999px; background: var(--teal-light); color: var(--teal); font-size: 12px; white-space: nowrap; }
+.issue-panel { margin-top: 24px; padding: 18px; border: 1px solid #f0d8bd; border-radius: 14px; background: #fffaf4; }
+.issue-heading { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 12px; }
+.issue-heading h3 { margin: 5px 0 0; font-size: 18px; }
+.issue-heading > span { padding: 5px 9px; border-radius: 999px; color: #8b5226; background: #f7e4d0; font-size: 12px; }
+.issue-card { display: flex; align-items: flex-start; gap: 12px; padding: 13px 12px; border-top: 1px solid #f0e1d1; transition: .18s ease; }
+.issue-card:first-of-type { border-top: 0; }
+.issue-card.disabled { opacity: .55; }
+.issue-card > div { min-width: 0; }
+.issue-card strong { font-size: 14px; line-height: 1.55; }
+.issue-card strong em { padding: 0 5px; color: var(--amber); font-style: normal; }
+.issue-card p { margin: 5px 0; color: #6d5948; font-size: 12px; line-height: 1.55; }
+.issue-card small { color: #917863; font-size: 11px; }
 .rule-list { margin: 26px 0 20px; display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
 .rule-card { min-width: 0; padding: 17px; display: flex; align-items: flex-start; gap: 12px; border: 1px solid #dce7e4; border-radius: 13px; background: #fbfdfc; transition: .18s ease; }
 .rule-card.disabled { opacity: .52; background: #f5f6f6; }

@@ -37,13 +37,17 @@ import java.security.MessageDigest;
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
 import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
+import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.zip.ZipFile;
 
@@ -60,12 +64,15 @@ public final class WordFormatProcessor {
     private static final Pattern LEVEL_2 = Pattern.compile("^\\d+\\.\\d+\\s*\\S.*$");
     private static final Pattern LEVEL_1 = Pattern.compile("^\\d+\\s*[^\\d.\\s].*$");
     private static final Pattern TABLE_CAPTION = Pattern.compile("^表\\s*\\d+[-－]\\d+.*$");
+    private static final Pattern FIGURE_CAPTION = Pattern.compile("^图\\s*\\d+[-－]\\d+.*$");
     private static final Pattern CONTINUED_TABLE = Pattern.compile("^续表\\s*\\d+[-－]\\d+.*$");
+    private static final Pattern HEADING_PREFIX = Pattern.compile("^(\\d+(?:\\.\\d+){0,3})\\s*(\\S.*)$");
+    private static final Pattern COVER_DATE = Pattern.compile("^(\\d{4})年(\\d{1,2})月(\\d{1,2})日$");
 
     // 工具会管理这些模板样式。缺少任意一个样式时，说明模板不符合当前处理器的假设。
     private static final Set<String> TEMPLATE_STYLE_NAMES = Set.of(
             "论文一级标题", "论文二级标题", "论文三级标题", "论文四级标题", "论文正文",
-            "论文表格序号及题目", "论文续表", "论文表格后面段落正文", "论文参考文献",
+            "论文图号图名", "论文表格序号及题目", "论文续表", "论文表格后面段落正文", "论文参考文献",
             "论文封面课题名称", "论文摘要中课题名称", "论文摘要正文", "参考文献及致谢",
             "toc 1", "toc 2"
     );
@@ -106,6 +113,14 @@ public final class WordFormatProcessor {
                 paragraphs.size(), allTables(source.getMainDocumentPart()).size(),
                 allSections(source.getMainDocumentPart()).size(), countImageRelationships(source.getMainDocumentPart()), detected);
         List<FormatPlan.Rule> rules = confirmationRules(templateRules);
+        List<FormatPlan.Issue> issues = detectStructureIssues(template, source, paragraphs, structure);
+        List<String> warnings = new ArrayList<>();
+        warnings.add("封面采用模板中的同类封面段落和信息表格式，同时保留用户填写的文字。");
+        warnings.add("目录保留为 Word 自动目录，并在本机装有 Microsoft Word 时刷新页码和点引导符。");
+        warnings.add("公式、浮动文本框和无法可靠匹配的复杂对象只保留，不自动重建。");
+        if (!issues.isEmpty()) {
+            warnings.add("检测到 " + issues.size() + " 个章节编号或标题文字问题；只有在确认页勾选后才会修改文字。");
+        }
         return new FormatPlan(
                 OffsetDateTime.now(ZoneOffset.UTC).toString(),
                 new ProcessingReport.InputFile(templatePath.toString(), Files.size(templatePath), sha256(templatePath)),
@@ -113,11 +128,8 @@ public final class WordFormatProcessor {
                 templateRules,
                 summary,
                 rules,
-                List.of(
-                        "封面采用模板中的同类封面段落和信息表格式，同时保留用户填写的文字。",
-                        "目录保留为 Word 自动目录，并在本机装有 Microsoft Word 时刷新页码和点引导符。",
-                        "公式、浮动文本框和无法可靠匹配的复杂对象只保留，不自动重建。"
-                )
+                issues,
+                warnings
         );
     }
 
@@ -130,6 +142,20 @@ public final class WordFormatProcessor {
             Path outputPath,
             Path reportPath,
             Set<String> enabledRuleKeys
+    ) throws Exception {
+        return process(templatePath, sourcePath, outputPath, reportPath, enabledRuleKeys, Set.of());
+    }
+
+    /**
+     * 按确认后的格式规则和内容修正项执行处理。
+     */
+    public ProcessingReport process(
+            Path templatePath,
+            Path sourcePath,
+            Path outputPath,
+            Path reportPath,
+            Set<String> enabledRuleKeys,
+            Set<String> acceptedIssueKeys
     ) throws Exception {
         requireDocx(templatePath, "template");
         requireDocx(sourcePath, "source");
@@ -151,6 +177,7 @@ public final class WordFormatProcessor {
         // 先从模板命名样式、示例段落和文字说明中生成可执行样式，再同步到目标文档。
         TemplateRuleExtractor.ensureOperationalStyles(template);
         P referenceParagraphTemplate = findReferenceParagraphTemplate(template);
+        P figureCaptionTemplate = findMatchingParagraph(template, FIGURE_CAPTION);
         Map<String, String> templateStyleIds = styleIdsByName(template);
         ensureRequiredStyles(templateStyleIds);
 
@@ -164,13 +191,17 @@ public final class WordFormatProcessor {
         MainDocumentPart targetMain = target.getMainDocumentPart();
         List<P> bodyParagraphs = directBodyParagraphs(targetMain);
         DocumentStructure structure = analyzeStructure(target, bodyParagraphs);
+        List<FormatPlan.Issue> structureIssues = detectStructureIssues(template, target, bodyParagraphs, structure);
+        List<ProcessingReport.Modification> modifications = new ArrayList<>();
+        applyConfirmedStructureFixes(bodyParagraphs, structureIssues, acceptedIssueKeys, modifications);
+        // 内容确认项可能把普通段落改成真正的标题，必须重新计算区域和角色。
+        structure = analyzeStructure(target, bodyParagraphs);
 
         if (enabled(enabledRuleKeys, "cover")) {
             applyCoverFormatting(template, target, structure);
         }
 
         // LinkedHashMap 保持角色出现顺序，报告阅读时更接近文档顺序。
-        List<ProcessingReport.Modification> modifications = new ArrayList<>();
         Map<String, Integer> detectedRoles = new LinkedHashMap<>();
 
         for (int i = 0; i < bodyParagraphs.size(); i++) {
@@ -210,8 +241,25 @@ public final class WordFormatProcessor {
 
             applyParagraphStyle(paragraph, desiredStyleId);
             applyRoleFormatting(paragraph, role);
+            if (role.equals("keywords-en")) {
+                P sample = findPrefixParagraph(template, "Key words", "Keywords");
+                if (sample != null) applyParagraphPropertiesFromSample(sample, paragraph);
+            }
             if (role.equals("reference-item") && referenceParagraphTemplate != null) {
                 applyParagraphPropertiesFromSample(referenceParagraphTemplate, paragraph);
+            }
+            if (role.equals("figure-caption") && figureCaptionTemplate != null) {
+                // 图片题注通常包含命名样式之外的居中、段前/段后等直接段落属性。
+                applyParagraphPropertiesFromSample(figureCaptionTemplate, paragraph);
+                applyRunPropertiesFromSample(figureCaptionTemplate, paragraph);
+            }
+            if (role.equals("toc-title") || role.equals("section-title")) {
+                applyTemplateDisplayText(template, paragraph, text);
+            }
+            if (role.equals("figure-caption")) {
+                keepFigureWithCaption(targetMain, paragraph);
+            } else if (role.equals("table-caption") || role.equals("continued-table-caption")) {
+                setKeepNext(paragraph);
             }
             modifications.add(new ProcessingReport.Modification(
                     i,
@@ -222,6 +270,17 @@ public final class WordFormatProcessor {
                     desiredStyleName,
                     preview(text)
             ));
+        }
+
+        if (enabled(enabledRuleKeys, "captions")) {
+            String figureCaptionStyleId = targetStyleIds.get(styleForRole("figure-caption"));
+            formatFigureCaptionsInsideTables(
+                    targetMain,
+                    figureCaptionTemplate,
+                    figureCaptionStyleId,
+                    detectedRoles,
+                    modifications
+            );
         }
 
         requestWordFieldRefresh(target);
@@ -240,7 +299,7 @@ public final class WordFormatProcessor {
         int sections = allSections(targetMain).size();
 
         ProcessingReport result = new ProcessingReport(
-                "Paper Format Modification Tool Core 0.6.0",
+                "Paper Format Modification Tool Core 0.7.0",
                 OffsetDateTime.now(ZoneOffset.UTC).toString(),
                 new ProcessingReport.InputFile(templatePath.toString(), Files.size(templatePath), templateHashBefore),
                 new ProcessingReport.InputFile(sourcePath.toString(), Files.size(sourcePath), sourceHashBefore),
@@ -250,7 +309,7 @@ public final class WordFormatProcessor {
                 new ProcessingReport.SectionSummary(
                         sectionResult.inspected(),
                         sectionResult.adjusted(),
-                        "同步模板的页面尺寸、页边距、分栏与文档网格；保留原说明书的分节符、页码起始值及页眉页脚。"
+                        "同步模板的页面尺寸、页边距、分栏与文档网格；按摘要、目录和正文分节连续计算页码，保留原页眉页脚。"
                 ),
                 modifications,
                 List.of(
@@ -267,14 +326,10 @@ public final class WordFormatProcessor {
                 ),
                 List.of(
                         "目录保留为 Word 的 TOC 域；若本机没有可用的 Microsoft Word，需要打开文件后右键目录并选择“更新整个目录”。",
-                        "公式、浮动文本框、复杂编号、交叉引用和题注分页会被保留，不会重新构建。",
+                        "公式、浮动文本框、复杂编号和交叉引用会被保留，不会重新构建。",
                         "涉及论文内容含义的问题只会列入人工复核，不会自动改写。"
                 ),
-                List.of(
-                        "一级标题“统总体设计”疑似缺少数字编号或存在文字错误；格式已保留，但没有擅自修改文字。",
-                        "题注“图5-10 后端运行图”与前一页图片被分页分开，建议人工确认。",
-                        "英文摘要内容延续到单独的关键词页面；这是内容长度导致的，未自动压缩。"
-                ),
+                manualReviewItems(structureIssues, acceptedIssueKeys),
                 new ProcessingReport.Verification(
                         templateHashBefore.equals(templateHashAfter),
                         sourceHashBefore.equals(sourceHashAfter),
@@ -353,7 +408,7 @@ public final class WordFormatProcessor {
             case "abstract-en", "keywords-en" -> "abstract-en";
             case "toc-title", "toc-level-1", "toc-level-2" -> "toc";
             case "heading-1", "heading-2", "heading-3", "heading-4" -> "headings";
-            case "table-caption", "continued-table-caption", "table-following-body" -> "captions";
+            case "figure-caption", "table-caption", "continued-table-caption", "table-following-body" -> "captions";
             case "reference-item" -> "references";
             case "thanks-body" -> "thanks";
             case "section-title" -> "references";
@@ -447,6 +502,9 @@ public final class WordFormatProcessor {
         PPr pPr = from.getPPr() == null ? new PPr() : copy(from.getPPr());
         pPr.setSectPr(preservedSection);
         to.setPPr(pPr);
+        if (copySemanticDateRunFormatting(from, to)) {
+            return;
+        }
         List<RPr> patterns = new ArrayList<>();
         for (Object item : from.getContent()) {
             Object value = XmlUtils.unwrap(item);
@@ -465,6 +523,63 @@ public final class WordFormatProcessor {
         }
     }
 
+    /**
+     * 封面日期不能按 run 序号复制格式：日期位数变化后，红色等局部格式会落到“日”字上。
+     * 这里按“年值、年、月值、月、日值、日”六个语义片段映射模板格式。
+     */
+    private static boolean copySemanticDateRunFormatting(P from, P to) {
+        String sourceText = normalizeText(TextUtils.getText(from)).replace(" ", "");
+        String targetText = normalizeText(TextUtils.getText(to)).replace(" ", "");
+        Matcher sourceDate = COVER_DATE.matcher(sourceText);
+        Matcher targetDate = COVER_DATE.matcher(targetText);
+        if (!sourceDate.matches() || !targetDate.matches()) return false;
+
+        List<RunSpan> sourceRuns = runSpans(from);
+        List<RunSpan> targetRuns = runSpans(to);
+        int[] sourcePositions = {
+                sourceDate.start(1), sourceDate.end(1),
+                sourceDate.start(2), sourceDate.end(2),
+                sourceDate.start(3), sourceDate.end(3), sourceDate.end(3) + 1
+        };
+        for (RunSpan targetRun : targetRuns) {
+            int semantic = dateSemanticIndex(targetDate, targetRun.start());
+            int sourcePosition = sourcePositions[Math.min(semantic, sourcePositions.length - 1)];
+            RPr pattern = runPropertiesAt(sourceRuns, sourcePosition);
+            targetRun.run().setRPr(pattern == null ? null : copy(pattern));
+        }
+        return true;
+    }
+
+    private static int dateSemanticIndex(Matcher date, int position) {
+        if (position < date.end(1)) return 0;       // 年份数字
+        if (position < date.start(2)) return 1;     // 年
+        if (position < date.end(2)) return 2;       // 月份数字
+        if (position < date.start(3)) return 3;     // 月
+        if (position < date.end(3)) return 4;       // 日期数字
+        return 5;                                   // 日
+    }
+
+    private static List<RunSpan> runSpans(P paragraph) {
+        List<RunSpan> result = new ArrayList<>();
+        int offset = 0;
+        for (Object item : paragraph.getContent()) {
+            Object value = XmlUtils.unwrap(item);
+            if (!(value instanceof R run)) continue;
+            String text = runText(run).replace(" ", "");
+            if (text.isEmpty()) continue;
+            result.add(new RunSpan(run, offset, offset + text.length()));
+            offset += text.length();
+        }
+        return result;
+    }
+
+    private static RPr runPropertiesAt(List<RunSpan> runs, int position) {
+        for (RunSpan run : runs) {
+            if (position >= run.start() && position < run.end()) return run.run().getRPr();
+        }
+        return runs.isEmpty() ? null : runs.get(runs.size() - 1).run().getRPr();
+    }
+
     private static String runText(R run) {
         StringBuilder result = new StringBuilder();
         for (Object item : run.getContent()) {
@@ -481,6 +596,373 @@ public final class WordFormatProcessor {
         return title >= 0 && sample >= 0 ? paragraphs.get(sample) : null;
     }
 
+    private static P findPrefixParagraph(WordprocessingMLPackage document, String... prefixes) {
+        List<P> paragraphs = directBodyParagraphs(document.getMainDocumentPart());
+        int index = findPrefixCompact(paragraphs, 0, paragraphs.size(), prefixes);
+        return index < 0 ? null : paragraphs.get(index);
+    }
+
+    private static P findMatchingParagraph(WordprocessingMLPackage document, Pattern pattern) {
+        for (P paragraph : directBodyParagraphs(document.getMainDocumentPart())) {
+            if (pattern.matcher(normalizeText(TextUtils.getText(paragraph))).matches()) {
+                return paragraph;
+            }
+        }
+        for (Tbl table : allTables(document.getMainDocumentPart())) {
+            for (P paragraph : paragraphsInTable(table)) {
+                if (pattern.matcher(normalizeText(TextUtils.getText(paragraph))).matches()) {
+                    return paragraph;
+                }
+            }
+        }
+        return null;
+    }
+
+    /** Keep the exact visible spacing used by short template titles such as “致    谢”. */
+    private static void applyTemplateDisplayText(
+            WordprocessingMLPackage template,
+            P target,
+            String targetText
+    ) {
+        String expectedCompact = compact(targetText);
+        for (P candidate : directBodyParagraphs(template.getMainDocumentPart())) {
+            String candidateText = displayText(TextUtils.getText(candidate));
+            if (compact(candidateText).equals(expectedCompact) && !candidateText.equals(targetText)) {
+                replaceParagraphText(target, candidateText);
+                return;
+            }
+        }
+    }
+
+    private static void setKeepNext(P paragraph) {
+        PPr pPr = paragraph.getPPr();
+        if (pPr == null) {
+            pPr = new PPr();
+            paragraph.setPPr(pPr);
+        }
+        BooleanDefaultTrue keepNext = new BooleanDefaultTrue();
+        keepNext.setVal(true);
+        pPr.setKeepNext(keepNext);
+    }
+
+    private static void setKeepLines(P paragraph) {
+        PPr pPr = paragraph.getPPr();
+        if (pPr == null) {
+            pPr = new PPr();
+            paragraph.setPPr(pPr);
+        }
+        BooleanDefaultTrue keepLines = new BooleanDefaultTrue();
+        keepLines.setVal(true);
+        pPr.setKeepLines(keepLines);
+    }
+
+    /**
+     * Keep an inline image, any blank spacer paragraphs immediately after it, and its caption
+     * on the same page. Real documents often contain one blank paragraph between an image and
+     * “图x-x ...”, so binding only the immediately preceding paragraph is insufficient.
+     */
+    private static void keepFigureWithCaption(MainDocumentPart main, P caption) {
+        setKeepLines(caption);
+
+        List<Object> bodyContent = main.getContent();
+        int captionPosition = -1;
+        for (int i = 0; i < bodyContent.size(); i++) {
+            if (XmlUtils.unwrap(bodyContent.get(i)) == caption) {
+                captionPosition = i;
+                break;
+            }
+        }
+        if (captionPosition < 0) return;
+
+        int minimum = Math.max(0, captionPosition - 4);
+        List<P> trailingBlankParagraphs = new ArrayList<>();
+        for (int cursor = captionPosition - 1; cursor >= minimum; cursor--) {
+            Object candidate = XmlUtils.unwrap(bodyContent.get(cursor));
+            if (candidate instanceof P paragraph) {
+                if (containsDrawing(paragraph)) {
+                    setKeepNext(paragraph);
+                    trailingBlankParagraphs.forEach(WordFormatProcessor::setKeepNext);
+                    return;
+                }
+                if (normalizeText(TextUtils.getText(paragraph)).isBlank()) {
+                    trailingBlankParagraphs.add(paragraph);
+                    continue;
+                }
+                return;
+            }
+
+            if (candidate instanceof Tbl table && containsDrawing(table)) {
+                List<P> tableParagraphs = paragraphsInTable(table);
+                // 图片常被 Word 放进一行一列的无边框表格；把表格最后的段落链到题注。
+                for (P tableParagraph : tableParagraphs) {
+                    setKeepNext(tableParagraph);
+                    setKeepLines(tableParagraph);
+                }
+                trailingBlankParagraphs.forEach(WordFormatProcessor::setKeepNext);
+                return;
+            }
+            return;
+        }
+    }
+
+    private static boolean containsDrawing(P paragraph) {
+        return containsDrawing((Object) paragraph);
+    }
+
+    private static boolean containsDrawing(Object value) {
+        String xml = XmlUtils.marshaltoString(value, true, true).toLowerCase(Locale.ROOT);
+        return xml.contains(":drawing") || xml.contains(":pict") || xml.contains(":imagedata");
+    }
+
+    private static void formatFigureCaptionsInsideTables(
+            MainDocumentPart main,
+            P sample,
+            String styleId,
+            Map<String, Integer> detectedRoles,
+            List<ProcessingReport.Modification> modifications
+    ) {
+        if (styleId == null) return;
+        int nestedIndex = -1;
+        for (Tbl table : allTables(main)) {
+            List<P> paragraphs = paragraphsInTable(table);
+            for (int i = 0; i < paragraphs.size(); i++) {
+                P paragraph = paragraphs.get(i);
+                String text = normalizeText(TextUtils.getText(paragraph));
+                if (!FIGURE_CAPTION.matcher(text).matches()) continue;
+
+                String beforeStyleId = getStyleId(paragraph);
+                applyParagraphStyle(paragraph, styleId);
+                applyRoleFormatting(paragraph, "figure-caption");
+                if (sample != null) {
+                    applyParagraphPropertiesFromSample(sample, paragraph);
+                    applyRunPropertiesFromSample(sample, paragraph);
+                }
+                setKeepLines(paragraph);
+
+                for (int previous = i - 1; previous >= Math.max(0, i - 4); previous--) {
+                    P candidate = paragraphs.get(previous);
+                    if (containsDrawing(candidate)) {
+                        setKeepNext(candidate);
+                        for (int spacer = previous + 1; spacer < i; spacer++) {
+                            setKeepNext(paragraphs.get(spacer));
+                        }
+                        break;
+                    }
+                    if (!normalizeText(TextUtils.getText(candidate)).isBlank()) break;
+                }
+
+                detectedRoles.merge("figure-caption", 1, Integer::sum);
+                modifications.add(new ProcessingReport.Modification(
+                        nestedIndex--,
+                        "figure-caption",
+                        beforeStyleId,
+                        "论文图号图名（表格内题注）",
+                        preview(text)
+                ));
+            }
+        }
+    }
+
+    private static List<P> paragraphsInTable(Tbl table) {
+        List<P> result = new ArrayList<>();
+        collectTableParagraphs(table, result);
+        return result;
+    }
+
+    private static void collectTableParagraphs(Object node, List<P> result) {
+        Object value = XmlUtils.unwrap(node);
+        if (value instanceof P paragraph) {
+            result.add(paragraph);
+        } else if (value instanceof Tbl table) {
+            table.getContent().forEach(item -> collectTableParagraphs(item, result));
+        } else if (value instanceof Tr row) {
+            row.getContent().forEach(item -> collectTableParagraphs(item, result));
+        } else if (value instanceof Tc cell) {
+            cell.getContent().forEach(item -> collectTableParagraphs(item, result));
+        }
+    }
+
+    private static List<FormatPlan.Issue> detectStructureIssues(
+            WordprocessingMLPackage template,
+            WordprocessingMLPackage source,
+            List<P> paragraphs,
+            DocumentStructure structure
+    ) throws Exception {
+        Map<Integer, String> templateChapterTitles = new LinkedHashMap<>();
+        for (P paragraph : directBodyParagraphs(template.getMainDocumentPart())) {
+            String text = normalizeText(TextUtils.getText(paragraph));
+            Matcher matcher = HEADING_PREFIX.matcher(text);
+            if (!matcher.matches() || matcher.group(1).contains(".")) continue;
+            if (!"论文一级标题".equals(styleNameById(template, getStyleId(paragraph)))) continue;
+            templateChapterTitles.putIfAbsent(Integer.parseInt(matcher.group(1)), text);
+        }
+
+        Set<String> allPrefixes = new LinkedHashSet<>();
+        for (int i = structure.mainStart(); i < structure.referencesStart(); i++) {
+            Matcher matcher = HEADING_PREFIX.matcher(normalizeText(TextUtils.getText(paragraphs.get(i))));
+            if (matcher.matches()) allPrefixes.add(matcher.group(1));
+        }
+
+        List<FormatPlan.Issue> result = new ArrayList<>();
+        Set<String> seenPrefixes = new HashSet<>();
+        Set<Integer> seenChapters = new HashSet<>();
+        Set<Integer> reportedMissingChapters = new HashSet<>();
+        for (int i = structure.mainStart(); i < structure.referencesStart(); i++) {
+            String text = normalizeText(TextUtils.getText(paragraphs.get(i)));
+            Matcher matcher = HEADING_PREFIX.matcher(text);
+            if (!matcher.matches()) continue;
+            String prefix = matcher.group(1);
+            String[] parts = prefix.split("\\.");
+            int chapter = Integer.parseInt(parts[0]);
+
+            if (parts.length > 1 && !seenChapters.contains(chapter)
+                    && reportedMissingChapters.add(chapter)
+                    && templateChapterTitles.containsKey(chapter)) {
+                int candidateIndex = previousNonEmpty(paragraphs, i - 1, structure.mainStart());
+                if (candidateIndex >= structure.mainStart()) {
+                    String candidate = normalizeText(TextUtils.getText(paragraphs.get(candidateIndex)));
+                    if (!candidate.isBlank() && candidate.length() <= 30
+                            && !HEADING_PREFIX.matcher(candidate).matches()
+                            && !candidate.matches(".*[。；;，,：:]$")) {
+                        String suggestion = templateChapterTitles.get(chapter);
+                        result.add(new FormatPlan.Issue(
+                                "missing-heading-" + candidateIndex,
+                                "MISSING_HEADING_NUMBER",
+                                candidateIndex,
+                                candidate,
+                                suggestion,
+                                "后续出现“" + prefix + "”，但此前没有第 " + chapter
+                                        + " 章一级标题；模板中的对应标题是“" + suggestion + "”。",
+                                98,
+                                true
+                        ));
+                        seenChapters.add(chapter);
+                    }
+                }
+            }
+
+            if (parts.length == 1) seenChapters.add(chapter);
+            if (!seenPrefixes.add(prefix)) {
+                String replacementPrefix = nextAvailablePrefix(prefix, allPrefixes);
+                String suggestion = replacementPrefix + " " + matcher.group(2);
+                result.add(new FormatPlan.Issue(
+                        "duplicate-heading-" + i,
+                        "DUPLICATE_HEADING_NUMBER",
+                        i,
+                        text,
+                        suggestion,
+                        "章节编号“" + prefix + "”在正文中重复，建议使用下一个未占用编号“"
+                                + replacementPrefix + "”。",
+                        96,
+                        true
+                ));
+                allPrefixes.add(replacementPrefix);
+            }
+        }
+        return result;
+    }
+
+    private static String nextAvailablePrefix(String prefix, Set<String> used) {
+        String[] parts = prefix.split("\\.");
+        int last = Integer.parseInt(parts[parts.length - 1]);
+        String parent = parts.length == 1 ? "" : String.join(".", java.util.Arrays.copyOf(parts, parts.length - 1)) + ".";
+        String candidate;
+        do {
+            candidate = parent + (++last);
+        } while (used.contains(candidate));
+        return candidate;
+    }
+
+    private static void applyConfirmedStructureFixes(
+            List<P> paragraphs,
+            List<FormatPlan.Issue> issues,
+            Set<String> acceptedIssueKeys,
+            List<ProcessingReport.Modification> modifications
+    ) {
+        Set<String> accepted = acceptedIssueKeys == null ? Set.of() : acceptedIssueKeys;
+        for (FormatPlan.Issue issue : issues) {
+            if (!accepted.contains(issue.key())) continue;
+            if (issue.paragraphIndex() < 0 || issue.paragraphIndex() >= paragraphs.size()) continue;
+            P paragraph = paragraphs.get(issue.paragraphIndex());
+            String current = normalizeText(TextUtils.getText(paragraph));
+            if (!current.equals(issue.originalText())) continue;
+            replaceParagraphText(paragraph, issue.suggestedText());
+            modifications.add(new ProcessingReport.Modification(
+                    issue.paragraphIndex(), "confirmed-content-fix", issue.originalText(),
+                    issue.suggestedText(), issue.suggestedText()));
+            if ("DUPLICATE_HEADING_NUMBER".equals(issue.type())) {
+                cascadeConfirmedHeadingPrefix(paragraphs, issue, modifications);
+            }
+        }
+    }
+
+    private static void cascadeConfirmedHeadingPrefix(
+            List<P> paragraphs,
+            FormatPlan.Issue issue,
+            List<ProcessingReport.Modification> modifications
+    ) {
+        Matcher original = HEADING_PREFIX.matcher(issue.originalText());
+        Matcher suggested = HEADING_PREFIX.matcher(issue.suggestedText());
+        if (!original.matches() || !suggested.matches()) return;
+
+        String oldPrefix = original.group(1);
+        String newPrefix = suggested.group(1);
+        int parentDepth = oldPrefix.split("\\.").length;
+        for (int i = issue.paragraphIndex() + 1; i < paragraphs.size(); i++) {
+            P paragraph = paragraphs.get(i);
+            String current = normalizeText(TextUtils.getText(paragraph));
+            Matcher child = HEADING_PREFIX.matcher(current);
+            if (!child.matches()) continue;
+
+            String childPrefix = child.group(1);
+            int childDepth = childPrefix.split("\\.").length;
+            if (childDepth <= parentDepth) break;
+            if (!childPrefix.startsWith(oldPrefix + ".")) continue;
+
+            String replacement = newPrefix + childPrefix.substring(oldPrefix.length())
+                    + " " + child.group(2);
+            replaceParagraphText(paragraph, replacement);
+            modifications.add(new ProcessingReport.Modification(
+                    i,
+                    "confirmed-content-fix-child",
+                    current,
+                    replacement,
+                    replacement
+            ));
+        }
+    }
+
+    private static List<String> manualReviewItems(
+            List<FormatPlan.Issue> issues,
+            Set<String> acceptedIssueKeys
+    ) {
+        Set<String> accepted = acceptedIssueKeys == null ? Set.of() : acceptedIssueKeys;
+        List<String> result = new ArrayList<>();
+        for (FormatPlan.Issue issue : issues) {
+            if (!accepted.contains(issue.key())) {
+                result.add("未采用结构修正：“" + issue.originalText() + "” → “" + issue.suggestedText() + "”。");
+            }
+        }
+        result.add("英文摘要较长时，关键词可能自然延续到下一页；程序保持模板字号和行距，不压缩正文内容。");
+        return result;
+    }
+
+    private static void replaceParagraphText(P paragraph, String replacement) {
+        boolean written = false;
+        for (Object item : paragraph.getContent()) {
+            Object value = XmlUtils.unwrap(item);
+            if (!(value instanceof R run)) continue;
+            for (Object runItem : run.getContent()) {
+                Object runValue = XmlUtils.unwrap(runItem);
+                if (runValue instanceof Text text) {
+                    text.setValue(written ? "" : replacement);
+                    text.setSpace("preserve");
+                    written = true;
+                }
+            }
+        }
+    }
+
     /**
      * Copy sample paragraph properties that live outside the named style (notably reference
      * hanging indents), while retaining the target style id and any section break.
@@ -494,6 +976,26 @@ public final class WordFormatProcessor {
         replacement.setPStyle(targetStyle);
         replacement.setSectPr(targetSection);
         target.setPPr(replacement);
+    }
+
+    private static void applyRunPropertiesFromSample(P sample, P target) {
+        List<RPr> patterns = new ArrayList<>();
+        for (Object item : sample.getContent()) {
+            Object value = XmlUtils.unwrap(item);
+            if (value instanceof R run && !runText(run).isBlank()) {
+                patterns.add(run.getRPr() == null ? null : copy(run.getRPr()));
+            }
+        }
+        if (patterns.isEmpty()) return;
+        int runIndex = 0;
+        for (Object item : target.getContent()) {
+            Object value = XmlUtils.unwrap(item);
+            if (value instanceof R run && !runText(run).isBlank()) {
+                RPr pattern = patterns.get(Math.min(runIndex, patterns.size() - 1));
+                run.setRPr(pattern == null ? null : copy(pattern));
+                runIndex++;
+            }
+        }
     }
 
     /**
@@ -549,9 +1051,9 @@ public final class WordFormatProcessor {
     }
 
     /**
-     * 同步页面尺寸、页边距、分栏和文档网格。
+     * 同步页面尺寸、页边距、分栏和文档网格，并修正论文前置部分的连续页码。
      *
-     * <p>这里故意不复制页码起始值和页眉页脚关系，避免破坏原文档已有的分节页眉页脚。</p>
+     * <p>页眉页脚关系仍保留目标文档；摘要从 I 开始、目录继续摘要页码、正文从 1 开始。</p>
      */
     private static SectionResult synchronizeSectionLayout(WordprocessingMLPackage template, WordprocessingMLPackage target) throws Exception {
         List<SectPr> templateSections = allSections(template.getMainDocumentPart());
@@ -570,6 +1072,25 @@ public final class WordFormatProcessor {
 
             if (!before.equals(sectionLayoutSignature(to))) {
                 adjusted++;
+            }
+        }
+        if (targetSections.size() >= 4 && templateSections.size() >= 4) {
+            // 第 2 节是中英文摘要，从罗马数字 I 开始。
+            targetSections.get(1).setPgNumType(copy(templateSections.get(1).getPgNumType()));
+            if (targetSections.get(1).getPgNumType() != null) {
+                targetSections.get(1).getPgNumType().setStart(BigInteger.ONE);
+            }
+            // 第 3 节是目录，不能使用模板里固定的起始值；摘要篇幅变化时必须连续编号。
+            targetSections.get(2).setPgNumType(copy(templateSections.get(2).getPgNumType()));
+            if (targetSections.get(2).getPgNumType() != null) {
+                targetSections.get(2).getPgNumType().setStart(null);
+            }
+            // 最后一节是正文，按模板从阿拉伯数字 1 重新开始。
+            int lastTarget = targetSections.size() - 1;
+            int lastTemplate = templateSections.size() - 1;
+            targetSections.get(lastTarget).setPgNumType(copy(templateSections.get(lastTemplate).getPgNumType()));
+            if (targetSections.get(lastTarget).getPgNumType() != null) {
+                targetSections.get(lastTarget).getPgNumType().setStart(BigInteger.ONE);
             }
         }
         return new SectionResult(inspected, adjusted);
@@ -602,7 +1123,9 @@ public final class WordFormatProcessor {
                 value(columns == null ? null : columns.isSep()),
                 value(grid == null ? null : grid.getType()),
                 value(grid == null ? null : grid.getLinePitch()),
-                value(grid == null ? null : grid.getCharSpace())
+                value(grid == null ? null : grid.getCharSpace()),
+                value(pageNumbers == null ? null : pageNumbers.getFmt()),
+                value(pageNumbers == null ? null : pageNumbers.getStart())
         ).toString();
     }
 
@@ -745,6 +1268,7 @@ public final class WordFormatProcessor {
         if (index > structure.appendixStart() && index < structure.documentEnd()) return "appendix-body";
         if (index < structure.mainStart() || index >= structure.referencesStart()) return "front-or-back-matter";
         if (CONTINUED_TABLE.matcher(text).matches()) return "continued-table-caption";
+        if (FIGURE_CAPTION.matcher(text).matches()) return "figure-caption";
         if (TABLE_CAPTION.matcher(text).matches()) return "table-caption";
         if (LEVEL_4.matcher(text).matches()) return "heading-4";
         if (LEVEL_3.matcher(text).matches()) return "heading-3";
@@ -774,6 +1298,7 @@ public final class WordFormatProcessor {
             case "heading-3" -> "论文三级标题";
             case "heading-4" -> "论文四级标题";
             case "table-caption" -> "论文表格序号及题目";
+            case "figure-caption" -> "论文图号图名";
             case "continued-table-caption" -> "论文续表";
             case "table-following-body" -> "论文表格后面段落正文";
             case "reference-item" -> "论文参考文献";
@@ -793,7 +1318,7 @@ public final class WordFormatProcessor {
                     "toc-title", "toc-level-1", "toc-level-2", "body",
                     "heading-1", "heading-2", "heading-3", "heading-4",
                     "section-title", "reference-item", "thanks-body", "appendix-body",
-                    "table-caption", "continued-table-caption" -> true;
+                    "figure-caption", "table-caption", "continued-table-caption" -> true;
             default -> false;
         };
     }
@@ -939,6 +1464,11 @@ public final class WordFormatProcessor {
                 setRunFormat(run, eastAsia, latin, halfPoints, true);
                 matched = normalized.contains(":") || normalized.contains("：") || normalized.length() >= compactLabel.length();
             } else if (matched) {
+                String punctuation = valueText.trim();
+                if (punctuation.matches("^[：:]+$")) {
+                    setRunFormat(run, eastAsia, latin, halfPoints, true);
+                    continue;
+                }
                 break;
             }
         }
@@ -1012,12 +1542,15 @@ public final class WordFormatProcessor {
         String escaped = document.toAbsolutePath().toString().replace("'", "''");
         String script = "$ErrorActionPreference='Stop';"
                 + "$w=New-Object -ComObject Word.Application;"
-                + "$w.Visible=$false;$w.DisplayAlerts=0;"
+                + "$w.Visible=$false;$w.DisplayAlerts=0;$w.Options.Pagination=$true;"
                 + "try{$d=$w.Documents.Open('" + escaped + "',$false,$false);"
+                + "$d.Repaginate();"
                 + "foreach($t in $d.TablesOfContents){$t.Update()};"
                 + "foreach($s in $d.Sections){foreach($h in $s.Headers){$h.Range.Fields.Update()|Out-Null};"
                 + "foreach($f in $s.Footers){$f.Range.Fields.Update()|Out-Null}};"
-                + "$d.Fields.Update()|Out-Null;$d.Save();$d.Close()}"
+                + "$d.Fields.Update()|Out-Null;$d.Repaginate();"
+                + "foreach($s in $d.Sections){foreach($f in $s.Footers){$f.Range.Fields.Update()|Out-Null}};"
+                + "$d.Save();$d.Close()}"
                 + "finally{$w.Quit();[Runtime.InteropServices.Marshal]::FinalReleaseComObject($w)|Out-Null}";
         Process process = null;
         try {
@@ -1202,6 +1735,11 @@ public final class WordFormatProcessor {
         return text.replace('\u00A0', ' ').replaceAll("[\\r\\n\\t]+", " ").replaceAll("\\s+", " ").trim();
     }
 
+    private static String displayText(String text) {
+        if (text == null) return "";
+        return text.replace('\u00A0', ' ').replaceAll("[\\r\\n\\t]+", " ").trim();
+    }
+
     private static String preview(String text) {
         return text.length() <= 90 ? text : text.substring(0, 90) + "...";
     }
@@ -1246,6 +1784,9 @@ public final class WordFormatProcessor {
     }
 
     private record SectionResult(int inspected, int adjusted) {
+    }
+
+    private record RunSpan(R run, int start, int end) {
     }
 
     /**

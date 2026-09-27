@@ -2,7 +2,8 @@ param(
     [string]$Template,
     [string]$Source,
     [string]$Output,
-    [string]$Report
+    [string]$Report,
+    [string]$AcceptedIssueKeys
 )
 
 $ErrorActionPreference = 'Stop'
@@ -36,7 +37,12 @@ try {
 
     $dependencyClasspath = Get-Content -LiteralPath $classpathFile -Raw
     $runtimeClasspath = "$(Join-Path $coreRoot 'target\classes');$($dependencyClasspath.Trim())"
-    & $java -cp $runtimeClasspath com.paperformat.core.PaperFormatCli $Template $Source $Output $Report
+    if ($AcceptedIssueKeys) {
+        & $java -cp $runtimeClasspath com.paperformat.core.PaperFormatCli $Template $Source $Output $Report $AcceptedIssueKeys
+    }
+    else {
+        & $java -cp $runtimeClasspath com.paperformat.core.PaperFormatCli $Template $Source $Output $Report
+    }
     if ($LASTEXITCODE -ne 0) {
         throw "格式处理失败，退出码：$LASTEXITCODE"
     }

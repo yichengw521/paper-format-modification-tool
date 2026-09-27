@@ -24,7 +24,7 @@ Possible states: `ANALYZING`, `AWAITING_CONFIRMATION`, `QUEUED`, `PROCESSING`, `
 ## Review and confirm the format plan
 
 - `GET /tasks/{taskId}/analysis`: read the extracted page, cover, abstract, TOC, body, reference, and acknowledgement rules when the state is `AWAITING_CONFIRMATION`
-- `POST /tasks/{taskId}/confirm` with JSON such as `{"enabledRuleKeys":["page","cover","abstract-zh","abstract-en","toc","headings","body","captions","references","thanks"]}`: persist the confirmation and begin formatting
+- `POST /tasks/{taskId}/confirm` with JSON such as `{"enabledRuleKeys":["page","cover","abstract-zh","abstract-en","toc","headings","body","captions","references","thanks"],"acceptedIssueKeys":["missing-heading-453","duplicate-heading-987"]}`: persist the selected format rules and explicitly accepted chapter-text corrections, then begin formatting
 
 No output DOCX is created before the confirmation request.
 

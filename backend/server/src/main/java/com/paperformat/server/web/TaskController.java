@@ -70,7 +70,8 @@ public class TaskController {
             @PathVariable String taskId,
             @RequestBody ConfirmationRequest request
     ) throws IOException {
-        return ResponseEntity.accepted().body(taskService.confirm(taskId, request.enabledRuleKeys()));
+        return ResponseEntity.accepted().body(taskService.confirm(
+                taskId, request.enabledRuleKeys(), request.acceptedIssueKeys()));
     }
 
     /**
@@ -104,6 +105,6 @@ public class TaskController {
                 .body(resource);
     }
 
-    public record ConfirmationRequest(List<String> enabledRuleKeys) {
+    public record ConfirmationRequest(List<String> enabledRuleKeys, List<String> acceptedIssueKeys) {
     }
 }
