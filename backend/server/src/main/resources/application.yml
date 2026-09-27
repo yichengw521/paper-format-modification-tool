@@ -1,0 +1,21 @@
+server:
+  port: ${PAPER_FORMAT_PORT:8080}
+
+spring:
+  application:
+    name: paper-format-server
+  servlet:
+    multipart:
+      max-file-size: 50MB
+      max-request-size: 100MB
+  jackson:
+    serialization:
+      indent-output: true
+
+paper-format:
+  storage-root: ${PAPER_FORMAT_STORAGE:./storage}
+
+logging:
+  level:
+    org.docx4j: WARN
+    org.docx4j.XmlUtils: ERROR

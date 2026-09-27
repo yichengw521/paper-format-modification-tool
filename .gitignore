@@ -1,0 +1,20 @@
+backend/*/target/
+frontend/node_modules/
+frontend/dist/
+work/npm-cache/
+.idea/
+*.iml
+
+# 用户上传和生成的文档
+storage/
+work/
+
+# 前端构建后复制进后端的生成文件
+backend/server/src/main/resources/static/
+
+# 日志
+*.log
+
+# Windows 临时文件
+Thumbs.db
+Desktop.ini
