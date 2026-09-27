@@ -14,6 +14,9 @@ import org.docx4j.wml.RFonts;
 import org.docx4j.wml.RPr;
 import org.docx4j.wml.SectPr;
 import org.docx4j.wml.Style;
+import org.docx4j.wml.Tbl;
+import org.docx4j.wml.Tr;
+import org.docx4j.wml.Tc;
 
 import java.math.BigDecimal;
 import java.math.BigInteger;
@@ -25,6 +28,8 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 /**
  * Reads the template itself instead of returning a hard-coded description.
@@ -39,11 +44,29 @@ final class TemplateRuleExtractor {
     }
 
     static void ensureOperationalStyles(WordprocessingMLPackage template) throws Exception {
+        ensureOperationalStyles(template, null);
+    }
+
+    /**
+     * Builds the canonical styles used by the formatter.  When a template contains only prose
+     * requirements, the source document supplies the neutral base style and the prose requirement
+     * is applied as an override.  This prevents a text-only requirements document from silently
+     * imposing its own Normal style on the user's thesis.
+     */
+    static void ensureOperationalStyles(
+            WordprocessingMLPackage template,
+            WordprocessingMLPackage source
+    ) throws Exception {
         StyleDefinitionsPart part = template.getMainDocumentPart().getStyleDefinitionsPart();
         Map<String, Style> styles = stylesByName(template);
         List<P> paragraphs = directParagraphs(template);
-        Map<String, String> instructionByRole = mapInstructionsToRoles(extractInstructions(template));
+        List<String> instructions = extractInstructions(template);
+        Map<String, String> instructionByRole = mapInstructionsToRoles(instructions);
+        boolean textOnly = source != null
+                && "TEXT_INSTRUCTIONS_ONLY".equals(detectMode(template, instructions, styles));
         PropertyResolver resolver = new PropertyResolver(template);
+        Map<String, Style> sourceStyles = source == null ? Map.of() : stylesByName(source);
+        List<P> sourceParagraphs = source == null ? List.of() : directParagraphs(source);
 
         for (Map.Entry<String, String> entry : CANONICAL_STYLES.entrySet()) {
             String role = entry.getKey();
@@ -52,25 +75,61 @@ final class TemplateRuleExtractor {
             if (existing != null) {
                 // 同名样式是最高优先级证据。文字说明只用于解释或补齐缺失样式，
                 // 不能反过来覆盖模板样式中的缩进、段距和制表位。
+                if (role.equals("toc1") || role.equals("toc2")) {
+                    P sample = findParagraphUsingStyle(paragraphs, existing.getStyleId());
+                    mergeDirectParagraphPropertiesIntoStyle(existing, sample);
+                }
+                if (role.equals("abstract")) forceFirstLine(existing, 0);
                 continue;
             }
 
             RoleDefinition definition = ROLES.get(role);
-            Style alias = definition == null ? null : findStyle(styles, definition.styleCandidates());
+            // A prose-only requirements document may happen to contain a localized built-in
+            // style named "正文".  That is document chrome, not an authoritative format sample.
+            // In this mode the source document must supply the base style/paragraph structure,
+            // and the prose requirements must be applied as explicit overrides.
+            Style alias = textOnly || definition == null
+                    ? null : findStyle(styles, definition.styleCandidates());
+            boolean sourceDerived = false;
+            if (alias == null && definition != null && source != null) {
+                alias = findStyle(sourceStyles, definition.styleCandidates());
+                sourceDerived = alias != null;
+            }
             Style created;
             if (alias != null) {
                 created = cloneAs(alias, canonicalName, role);
             } else {
-                P sample = findSampleParagraph(paragraphs, role);
+                P sample = textOnly ? null
+                        : role.equals("tableCell") ? findTableCellSample(template)
+                        : role.equals("figureCaption") ? findFigureCaptionSample(template)
+                        : findSampleParagraph(paragraphs, role);
+                if ((sample == null || textOnly) && source != null) {
+                    sample = findSourceSampleParagraph(sourceParagraphs, role);
+                    sourceDerived = sample != null;
+                }
                 if (sample != null) {
-                    created = styleFromSample(sample, canonicalName, role, resolver);
+                    PropertyResolver sampleResolver = sourceDerived ? new PropertyResolver(source) : resolver;
+                    created = styleFromSample(sample, canonicalName, role, sampleResolver);
                 } else {
                     String instruction = instructionByRole.get(role);
                     if (instruction == null && role.equals("thanksBody")) instruction = instructionByRole.get("body");
                     if (instruction == null && role.equals("heading4")) instruction = instructionByRole.get("body");
-                    if (instruction == null) continue;
-                    created = styleFromInstruction(canonicalName, role, instruction);
+                    if (instruction != null) {
+                        created = styleFromInstruction(canonicalName, role, executionInstruction(role, instruction));
+                    } else {
+                        Style normal = findStyle(sourceStyles, List.of("normal", "正文"));
+                        created = normal == null
+                                ? baseStyle(canonicalName, role)
+                                : cloneAs(normal, canonicalName, role);
+                        sourceDerived = normal != null;
+                    }
                 }
+            }
+            String instruction = instructionByRole.get(role);
+            if (instruction == null && role.equals("thanksBody")) instruction = instructionByRole.get("body");
+            if (instruction == null && role.equals("heading4")) instruction = instructionByRole.get("body");
+            if (instruction != null && (textOnly || sourceDerived || role.equals("tableCell"))) {
+                applyInstructionOverrides(created, executionInstruction(role, instruction));
             }
             part.getJaxbElement().getStyle().add(created);
             styles.put(canonicalName.toLowerCase(Locale.ROOT), created);
@@ -78,6 +137,13 @@ final class TemplateRuleExtractor {
     }
 
     static ProcessingReport.TemplateRules extract(WordprocessingMLPackage template) throws Exception {
+        return extract(template, detectMode(template));
+    }
+
+    static ProcessingReport.TemplateRules extract(
+            WordprocessingMLPackage template,
+            String detectedMode
+    ) throws Exception {
         List<String> instructions = extractInstructions(template);
         Map<String, String> instructionByRole = mapInstructionsToRoles(instructions);
         Map<String, Style> stylesByName = stylesByName(template);
@@ -92,12 +158,17 @@ final class TemplateRuleExtractor {
             if (style != null) {
                 RPr rPr = resolver.getEffectiveRPr(style.getStyleId());
                 PPr pPr = resolver.getEffectivePPr(style.getStyleId());
+                RPr directRPr = style.getRPr();
+                PPr directPPr = style.getPPr();
+                RPr fontRPr = hasExplicitFont(directRPr) ? directRPr : rPr;
+                RPr sizeRPr = directRPr != null && directRPr.getSz() != null ? directRPr : rPr;
+                PPr paragraphPPr = hasExplicitParagraphFormatting(directPPr) ? directPPr : pPr;
                 rules.put(key, new ProcessingReport.StyleRule(
                         definition.label(),
                         styleName(style),
-                        describeFonts(rPr),
-                        describeSize(rPr),
-                        describeParagraph(pPr),
+                        describeFonts(fontRPr),
+                        describeSize(sizeRPr),
+                        describeParagraph(paragraphPPr),
                         evidence == null ? "NAMED_STYLE" : "NAMED_STYLE+TEXT_INSTRUCTION",
                         evidence == null ? "模板样式定义：" + styleName(style) : evidence
                 ));
@@ -115,7 +186,10 @@ final class TemplateRuleExtractor {
         }
 
         SectPr section = firstSection(template);
+        String mode = detectedMode == null ? detectMode(template, instructions, stylesByName) : detectedMode;
         return new ProcessingReport.TemplateRules(
+                mode,
+                modeDescription(mode),
                 describePageSize(section),
                 describeMargins(section),
                 describeHeaderFooterDistances(section),
@@ -129,6 +203,8 @@ final class TemplateRuleExtractor {
         result.put("coverTitle", new RoleDefinition("封面课题名称", List.of("论文封面课题名称", "封面课题名称", "封面标题")));
         result.put("title", new RoleDefinition("中英文论文题目", List.of("论文摘要中课题名称", "论文题目", "摘要中课题名称")));
         result.put("abstract", new RoleDefinition("摘要正文", List.of("论文摘要正文", "摘要正文")));
+        result.put("figureCaption", new RoleDefinition("图号及图名", List.of("论文图号图名", "图号图名", "图题")));
+        result.put("tableCell", new RoleDefinition("表格正文", List.of("论文表格正文", "表格正文", "表内文字")));
         result.put("tocTitle", new RoleDefinition("目录标题", List.of("参考文献及致谢", "目录标题")));
         result.put("toc1", new RoleDefinition("一级目录条目", List.of("toc 1", "目录 1", "目录一级")));
         result.put("toc2", new RoleDefinition("二级目录条目", List.of("toc 2", "目录 2", "目录二级")));
@@ -151,6 +227,8 @@ final class TemplateRuleExtractor {
         result.put("coverTitle", "论文封面课题名称");
         result.put("title", "论文摘要中课题名称");
         result.put("abstract", "论文摘要正文");
+        result.put("figureCaption", "论文图号图名");
+        result.put("tableCell", "论文表格正文");
         result.put("tocTitle", "参考文献及致谢");
         result.put("toc1", "toc 1");
         result.put("toc2", "toc 2");
@@ -179,7 +257,13 @@ final class TemplateRuleExtractor {
 
     private static Style styleFromSample(P sample, String name, String role, PropertyResolver resolver) {
         Style result = baseStyle(name, role);
-        PPr pPr = sample.getPPr() == null ? new PPr() : (PPr) XmlUtils.deepCopy(sample.getPPr());
+        String sampleStyleId = sample.getPPr() == null || sample.getPPr().getPStyle() == null
+                ? null : sample.getPPr().getPStyle().getVal();
+        PPr effectivePPr = sampleStyleId == null ? null : resolver.getEffectivePPr(sampleStyleId);
+        PPr pPr = effectivePPr == null ? new PPr() : (PPr) XmlUtils.deepCopy(effectivePPr);
+        result.setPPr(pPr);
+        mergeDirectParagraphPropertiesIntoStyle(result, sample);
+        pPr = result.getPPr();
         pPr.setPStyle(null);
         pPr.setSectPr(null);
         result.setPPr(pPr);
@@ -192,9 +276,9 @@ final class TemplateRuleExtractor {
                 break;
             }
         }
-        if (rPr == null) {
-            rPr = resolver.getEffectiveRPr(null, sample.getPPr());
-        }
+        if (rPr == null) rPr = sampleStyleId == null
+                ? resolver.getEffectiveRPr(null, sample.getPPr())
+                : resolver.getEffectiveRPr(sampleStyleId);
         result.setRPr(rPr == null ? new RPr() : (RPr) XmlUtils.deepCopy(rPr));
         return result;
     }
@@ -257,6 +341,14 @@ final class TemplateRuleExtractor {
             org.docx4j.wml.Jc jc = new org.docx4j.wml.Jc();
             jc.setVal(org.docx4j.wml.JcEnumeration.BOTH);
             pPr.setJc(jc);
+        } else if (instruction.contains("左对齐") || instruction.contains("左顶格")) {
+            org.docx4j.wml.Jc jc = new org.docx4j.wml.Jc();
+            jc.setVal(org.docx4j.wml.JcEnumeration.LEFT);
+            pPr.setJc(jc);
+        } else if (instruction.contains("右对齐")) {
+            org.docx4j.wml.Jc jc = new org.docx4j.wml.Jc();
+            jc.setVal(org.docx4j.wml.JcEnumeration.RIGHT);
+            pPr.setJc(jc);
         }
         PPrBase.Spacing parsedSpacing = spacingFromText(instruction);
         if (parsedSpacing != null) {
@@ -287,6 +379,20 @@ final class TemplateRuleExtractor {
             ind.setFirstLineChars(BigInteger.valueOf(200));
             pPr.setInd(ind);
         }
+        if (instruction.contains("左缩进为0") || instruction.contains("左缩进0") || instruction.contains("左顶格")) {
+            PPrBase.Ind ind = pPr.getInd() == null ? new PPrBase.Ind() : pPr.getInd();
+            ind.setLeft(BigInteger.ZERO);
+            ind.setLeftChars(BigInteger.ZERO);
+            pPr.setInd(ind);
+        }
+        Matcher hanging = Pattern.compile("悬挂缩进\\s*(\\d+(?:\\.\\d+)?)\\s*(?:个)?字符").matcher(instruction.replace(" ", ""));
+        if (hanging.find()) {
+            PPrBase.Ind ind = pPr.getInd() == null ? new PPrBase.Ind() : pPr.getInd();
+            int chars = (int) Math.round(Double.parseDouble(hanging.group(1)) * 100);
+            ind.setHangingChars(BigInteger.valueOf(chars));
+            ind.setLeftChars(BigInteger.valueOf(chars));
+            pPr.setInd(ind);
+        }
     }
 
     private static Style baseStyle(String name, String role) {
@@ -309,6 +415,12 @@ final class TemplateRuleExtractor {
 
     private static BigInteger halfPointsFromText(String text) {
         if (text.contains("小初")) return BigInteger.valueOf(72);
+        if (text.contains("初号")) return BigInteger.valueOf(84);
+        if (text.contains("小一")) return BigInteger.valueOf(48);
+        if (text.contains("一号")) return BigInteger.valueOf(52);
+        if (text.contains("小二")) return BigInteger.valueOf(36);
+        if (text.contains("二号")) return BigInteger.valueOf(44);
+        if (text.contains("小三")) return BigInteger.valueOf(30);
         if (text.contains("三号")) return BigInteger.valueOf(32);
         if (text.contains("小四")) return BigInteger.valueOf(24);
         if (text.contains("四号")) return BigInteger.valueOf(28);
@@ -333,6 +445,22 @@ final class TemplateRuleExtractor {
             spacing.setLine(BigInteger.valueOf(240));
             spacing.setLineRule(org.docx4j.wml.STLineSpacingRule.AUTO);
             present = true;
+        } else if (compact.contains("1.5倍行距") || compact.contains("1.5倍")) {
+            spacing.setLine(BigInteger.valueOf(360));
+            spacing.setLineRule(org.docx4j.wml.STLineSpacingRule.AUTO);
+            present = true;
+        } else if (compact.contains("2倍行距") || compact.contains("双倍行距")) {
+            spacing.setLine(BigInteger.valueOf(480));
+            spacing.setLineRule(org.docx4j.wml.STLineSpacingRule.AUTO);
+            present = true;
+        } else {
+            Matcher exact = Pattern.compile("(?:固定值|行距)(\\d+(?:\\.\\d+)?)磅").matcher(compact);
+            if (exact.find()) {
+                int twips = (int) Math.round(Double.parseDouble(exact.group(1)) * 20);
+                spacing.setLine(BigInteger.valueOf(twips));
+                spacing.setLineRule(org.docx4j.wml.STLineSpacingRule.EXACT);
+                present = true;
+            }
         }
         if (compact.contains("段前、段后各1行")) {
             spacing.setBeforeLines(BigInteger.valueOf(100));
@@ -409,17 +537,150 @@ final class TemplateRuleExtractor {
         return null;
     }
 
+    private static P findParagraphUsingStyle(List<P> paragraphs, String styleId) {
+        if (styleId == null) return null;
+        for (P paragraph : paragraphs) {
+            if (paragraph.getPPr() != null && paragraph.getPPr().getPStyle() != null
+                    && styleId.equals(paragraph.getPPr().getPStyle().getVal())) {
+                return paragraph;
+            }
+        }
+        return null;
+    }
+
+    private static void mergeDirectParagraphPropertiesIntoStyle(Style style, P sample) {
+        if (sample == null || sample.getPPr() == null) return;
+        PPr direct = sample.getPPr();
+        PPr merged = style.getPPr() == null ? new PPr() : (PPr) XmlUtils.deepCopy(style.getPPr());
+        if (direct.getJc() != null) merged.setJc((org.docx4j.wml.Jc) XmlUtils.deepCopy(direct.getJc()));
+        if (direct.getSpacing() != null) merged.setSpacing((PPrBase.Spacing) XmlUtils.deepCopy(direct.getSpacing()));
+        if (direct.getInd() != null) merged.setInd((PPrBase.Ind) XmlUtils.deepCopy(direct.getInd()));
+        if (direct.getTabs() != null) merged.setTabs((org.docx4j.wml.Tabs) XmlUtils.deepCopy(direct.getTabs()));
+        style.setPPr(merged);
+    }
+
+    private static void forceFirstLine(Style style, int characters) {
+        PPr pPr = style.getPPr() == null ? new PPr() : style.getPPr();
+        PPrBase.Ind ind = pPr.getInd() == null ? new PPrBase.Ind() : pPr.getInd();
+        if (characters == 0) {
+            ind.setFirstLine(BigInteger.ZERO);
+            ind.setFirstLineChars(BigInteger.ZERO);
+        } else {
+            ind.setFirstLine(null);
+            ind.setFirstLineChars(BigInteger.valueOf(characters));
+        }
+        pPr.setInd(ind);
+        style.setPPr(pPr);
+    }
+
+    private static P findSourceSampleParagraph(List<P> paragraphs, String role) {
+        for (P paragraph : paragraphs) {
+            String text = normalize(TextUtils.getText(paragraph));
+            if (text.isBlank()) continue;
+            String compact = text.replace(" ", "");
+            boolean match = switch (role) {
+                case "coverTitle" -> false;
+                case "title" -> compact.length() >= 4 && compact.length() <= 60
+                        && !compact.matches("^\\d+(?:\\.\\d+){0,3}.*$");
+                case "abstract" -> compact.startsWith("摘要") || compact.toLowerCase(Locale.ROOT).startsWith("abstract");
+                case "tocTitle" -> compact.equals("目录");
+                case "toc1" -> compact.matches("^\\d+[^.].*\\d+$");
+                case "toc2" -> compact.matches("^\\d+\\.\\d+.*\\d+$");
+                case "heading1" -> compact.matches("^\\d+[^\\d.].*$");
+                case "heading2" -> compact.matches("^\\d+\\.\\d+[^.].*$");
+                case "heading3" -> compact.matches("^\\d+\\.\\d+\\.\\d+[^.].*$");
+                case "heading4" -> compact.matches("^\\d+\\.\\d+\\.\\d+\\.\\d+.*$");
+                case "figureCaption" -> compact.matches("^图\\d+[-－]\\d+.*$");
+                case "tableCaption", "continuedTableCaption" -> compact.matches("^(续)?表\\d+[-－]\\d+.*$");
+                case "references" -> compact.matches("^\\[?\\d+].*$");
+                case "sectionTitle" -> compact.equals("参考文献") || compact.equals("致谢") || compact.equals("附录");
+                case "body", "thanksBody", "tableFollowingBody", "tableCell" -> text.length() >= 20
+                        && !looksLikeInstruction(text)
+                        && !compact.matches("^\\d+(?:\\.\\d+){0,3}.*$");
+                default -> false;
+            };
+            if (match) return paragraph;
+        }
+        if (role.equals("coverTitle")) return nextNonEmpty(paragraphs, 0);
+        return null;
+    }
+
+    private static P findTableCellSample(WordprocessingMLPackage document) {
+        Body body = document.getMainDocumentPart().getJaxbElement().getBody();
+        for (Object item : body.getContent()) {
+            Object value = XmlUtils.unwrap(item);
+            if (!(value instanceof Tbl table)) continue;
+            String text = normalize(TextUtils.getText(table)).replace(" ", "");
+            String xml = XmlUtils.marshaltoString(table, true, true).toLowerCase(Locale.ROOT);
+            if (text.contains("专业") && (text.contains("学生姓名") || text.contains("指导教师"))) continue;
+            if (xml.contains(":drawing") || xml.contains(":pict") || xml.contains(":imagedata")) continue;
+            int rows = 0;
+            int maxCells = 0;
+            for (Object rowItem : table.getContent()) {
+                Object rowValue = XmlUtils.unwrap(rowItem);
+                if (!(rowValue instanceof Tr row)) continue;
+                rows++;
+                int cells = 0;
+                for (Object cellItem : row.getContent()) {
+                    if (XmlUtils.unwrap(cellItem) instanceof Tc) cells++;
+                }
+                maxCells = Math.max(maxCells, cells);
+            }
+            if (rows < 2 || maxCells < 2) continue;
+            List<P> paragraphs = new ArrayList<>();
+            collectParagraphs(table, paragraphs);
+            for (P paragraph : paragraphs) {
+                if (!normalize(TextUtils.getText(paragraph)).isBlank()) return paragraph;
+            }
+        }
+        return null;
+    }
+
+    private static P findFigureCaptionSample(WordprocessingMLPackage document) {
+        List<P> paragraphs = new ArrayList<>();
+        collectParagraphs(document.getMainDocumentPart().getJaxbElement().getBody(), paragraphs);
+        for (P paragraph : paragraphs) {
+            if (normalize(TextUtils.getText(paragraph)).replace(" ", "").matches("^图\\d+[-－]\\d+.*$")) {
+                return paragraph;
+            }
+        }
+        return null;
+    }
+
     private static List<String> extractInstructions(WordprocessingMLPackage template) {
         Set<String> result = new LinkedHashSet<>();
         Body body = template.getMainDocumentPart().getJaxbElement().getBody();
-        for (Object item : body.getContent()) {
-            Object value = XmlUtils.unwrap(item);
-            if (!(value instanceof P paragraph)) continue;
+        List<P> paragraphs = new ArrayList<>();
+        collectParagraphs(body, paragraphs);
+        for (P paragraph : paragraphs) {
             String text = normalize(TextUtils.getText(paragraph));
-            if (text.length() < 8 || text.length() > 260) continue;
+            if (text.length() < 5 || text.length() > 500) continue;
             if (looksLikeInstruction(text)) result.add(text);
         }
         return new ArrayList<>(result);
+    }
+
+    private static void collectParagraphs(Object node, List<P> result) {
+        Object value = XmlUtils.unwrap(node);
+        if (value instanceof P paragraph) {
+            result.add(paragraph);
+            return;
+        }
+        if (value instanceof Body body) {
+            body.getContent().forEach(item -> collectParagraphs(item, result));
+            return;
+        }
+        if (value instanceof org.docx4j.wml.Tbl table) {
+            table.getContent().forEach(item -> collectParagraphs(item, result));
+            return;
+        }
+        if (value instanceof org.docx4j.wml.Tr row) {
+            row.getContent().forEach(item -> collectParagraphs(item, result));
+            return;
+        }
+        if (value instanceof org.docx4j.wml.Tc cell) {
+            cell.getContent().forEach(item -> collectParagraphs(item, result));
+        }
     }
 
     private static boolean looksLikeInstruction(String text) {
@@ -436,6 +697,11 @@ final class TemplateRuleExtractor {
                 || value.contains("行距")
                 || value.contains("首行")
                 || value.contains("左缩进")
+                || value.contains("字体")
+                || value.contains("字号")
+                || value.contains("黑体")
+                || value.contains("宋体")
+                || value.toLowerCase(Locale.ROOT).contains("timesnewroman")
                 || value.contains("居中") && (value.contains("字体") || value.contains("字号"));
     }
 
@@ -462,14 +728,68 @@ final class TemplateRuleExtractor {
                 putEvidence(result, "thanksBody", text);
             }
             if (compact.contains("表格序号") || compact.contains("表格题目")) putEvidence(result, "tableCaption", text);
+            if (compact.contains("图号") || compact.contains("图题") || compact.contains("插图") && compact.contains("居中")) {
+                putEvidence(result, "figureCaption", text);
+            }
+            if (compact.contains("表格内") || compact.contains("表内") || compact.contains("表格正文")
+                    || compact.contains("表中文字") || compact.contains("表格内容")) {
+                putEvidence(result, "tableCell", text);
+            }
             if (compact.contains("表格后面") || compact.contains("表格后的第一行")) putEvidence(result, "tableFollowingBody", text);
-            if (compact.contains("参考文献列表")) putEvidence(result, "references", text);
+            if (compact.contains("参考文献列表") || compact.contains("参考文献")
+                    && (compact.contains("悬挂") || compact.contains("标点") || compact.contains("编号"))) {
+                putEvidence(result, "references", text);
+            }
         }
         return result;
     }
 
+    static String detectMode(WordprocessingMLPackage template) throws Exception {
+        List<String> instructions = extractInstructions(template);
+        return detectMode(template, instructions, stylesByName(template));
+    }
+
+    private static String detectMode(
+            WordprocessingMLPackage template,
+            List<String> instructions,
+            Map<String, Style> styles
+    ) {
+        int canonical = 0;
+        for (String name : CANONICAL_STYLES.values()) {
+            if (styles.containsKey(name.toLowerCase(Locale.ROOT))) canonical++;
+        }
+        if (!instructions.isEmpty() && canonical < 3) return "TEXT_INSTRUCTIONS_ONLY";
+        if (!instructions.isEmpty()) return "SAMPLE_AND_INSTRUCTIONS";
+        return "SAMPLE_OR_STYLE";
+    }
+
+    private static String modeDescription(String mode) {
+        return switch (mode) {
+            case "TEXT_INSTRUCTIONS_ONLY" -> "纯文字要求模式：先识别待修改文档结构，再把文字要求转换为结构化格式规则。";
+            case "SAMPLE_AND_INSTRUCTIONS" -> "样例与文字要求混合模式：样例格式优先，文字要求用于补充缺失规则。";
+            default -> "样例或样式模式：从模板的命名样式和示例组件提取格式。";
+        };
+    }
+
     private static void putEvidence(Map<String, String> target, String role, String text) {
         target.merge(role, text, (left, right) -> left.contains(right) ? left : left + " | " + right);
+    }
+
+    private static String executionInstruction(String role, String evidence) {
+        List<String> markers;
+        if (role.equals("abstract")) {
+            markers = List.of("摘要内容", "摘要正文", "正文内容");
+        } else if (role.equals("tableCell")) {
+            markers = List.of("表格内容", "表内文字", "表格内文字", "表中文字");
+        } else {
+            return evidence;
+        }
+        int offset = -1;
+        for (String marker : markers) {
+            int index = evidence.lastIndexOf(marker);
+            if (index >= 0) offset = Math.max(offset, index);
+        }
+        return offset < 0 ? evidence : evidence.substring(offset);
     }
 
     private static Map<String, Style> stylesByName(WordprocessingMLPackage template) throws Exception {
@@ -508,6 +828,17 @@ final class TemplateRuleExtractor {
         add(names, rPr.getRFonts().getAscii());
         add(names, rPr.getRFonts().getHAnsi());
         return names.isEmpty() ? "模板主题字体" : String.join(" / ", names);
+    }
+
+    private static boolean hasExplicitFont(RPr rPr) {
+        if (rPr == null || rPr.getRFonts() == null) return false;
+        RFonts fonts = rPr.getRFonts();
+        return fonts.getEastAsia() != null || fonts.getAscii() != null
+                || fonts.getHAnsi() != null || fonts.getCs() != null;
+    }
+
+    private static boolean hasExplicitParagraphFormatting(PPr pPr) {
+        return pPr != null && (pPr.getSpacing() != null || pPr.getInd() != null || pPr.getJc() != null);
     }
 
     private static String describeSize(RPr rPr) {
@@ -555,12 +886,13 @@ final class TemplateRuleExtractor {
     }
 
     private static String sizeFromText(String text) {
-        Map<String, String> sizes = Map.of(
-                "小初", "36 pt", "三号", "16 pt", "四号", "14 pt",
-                "小四", "12 pt", "五号", "10.5 pt", "小五", "9 pt"
-        );
-        for (Map.Entry<String, String> entry : sizes.entrySet()) {
-            if (text.contains(entry.getKey())) return entry.getKey() + "（" + entry.getValue() + "）" + (text.contains("加粗") ? "，加粗" : "");
+        String[][] sizes = {
+                {"小初", "36 pt"}, {"初号", "42 pt"}, {"小一", "24 pt"}, {"一号", "26 pt"},
+                {"小二", "18 pt"}, {"二号", "22 pt"}, {"小三", "15 pt"}, {"三号", "16 pt"},
+                {"小四", "12 pt"}, {"四号", "14 pt"}, {"小五", "9 pt"}, {"五号", "10.5 pt"}
+        };
+        for (String[] entry : sizes) {
+            if (text.contains(entry[0])) return entry[0] + "（" + entry[1] + "）" + (text.contains("加粗") ? "，加粗" : "");
         }
         return "文字说明未明确字号";
     }

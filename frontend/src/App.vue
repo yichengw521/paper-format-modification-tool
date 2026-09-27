@@ -33,6 +33,16 @@ const activeStep = computed(() => {
 const canSubmit = computed(() => Boolean(templateFile.value && documentFile.value)
   && !submitting.value)
 
+const templateModeName = computed(() => ({
+  TEXT_INSTRUCTIONS_ONLY: '纯文字要求模式',
+  SAMPLE_AND_INSTRUCTIONS: '样例与文字要求混合模式',
+  SAMPLE_OR_STYLE: '样例或样式模式',
+}[plan.value?.templateRules?.mode] || '自动识别模式'))
+
+const detectedStructureEntries = computed(() => Object.entries(
+  plan.value?.documentSummary?.detectedRoles || {},
+).filter(([, count]) => count > 0))
+
 // Element Plus 这里没有使用 Upload 组件，保留原生 input 便于直接拿到 File 对象。
 function chooseFile(event, kind) {
   const file = event.target.files?.[0]
@@ -275,6 +285,20 @@ onBeforeUnmount(stopPolling)
             </div>
           </div>
 
+          <el-alert
+            class="template-mode-alert"
+            :title="`模板识别结果：${templateModeName}`"
+            :description="plan.templateRules?.modeDescription || '系统已完成模板与文档结构识别。'"
+            type="info"
+            show-icon
+            :closable="false"
+          />
+
+          <div class="structure-summary">
+            <strong>从待修改文档识别出的结构</strong>
+            <span v-for="([role, count]) in detectedStructureEntries" :key="role">{{ role }} {{ count }}</span>
+          </div>
+
           <div v-if="plan.issues?.length" class="issue-panel">
             <div class="issue-heading">
               <div>
@@ -309,7 +333,7 @@ onBeforeUnmount(stopPolling)
             </article>
           </div>
 
-          <el-alert title="目录会保留为 Word 自动目录；本机安装 Microsoft Word 时会自动刷新页码和点引导符。" type="info" show-icon :closable="false" />
+          <el-alert title="目录会保留为 Word 自动目录；本机安装 Microsoft Word 时会自动刷新页码和点引导符。纯文字要求模板只应用明确写出的属性，未说明的属性保留原文档设置。" type="info" show-icon :closable="false" />
           <div class="confirm-actions">
             <button class="text-button" type="button" @click="startOver">重新选择文件</button>
             <el-button type="primary" size="large" :loading="submitting" @click="confirmPlan">确认并执行修改</el-button>

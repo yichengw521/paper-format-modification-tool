@@ -33,6 +33,8 @@ public record ProcessingReport(
 
     /** 从模板中抽象出的页面和样式规则说明。 */
     public record TemplateRules(
+            String mode,
+            String modeDescription,
             String pageSize,
             Map<String, Double> marginsCm,
             Map<String, Double> headerFooterDistanceCm,

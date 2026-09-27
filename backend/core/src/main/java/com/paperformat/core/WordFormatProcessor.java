@@ -68,12 +68,15 @@ public final class WordFormatProcessor {
     private static final Pattern CONTINUED_TABLE = Pattern.compile("^续表\\s*\\d+[-－]\\d+.*$");
     private static final Pattern HEADING_PREFIX = Pattern.compile("^(\\d+(?:\\.\\d+){0,3})\\s*(\\S.*)$");
     private static final Pattern COVER_DATE = Pattern.compile("^(\\d{4})年(\\d{1,2})月(\\d{1,2})日$");
+    private static final Pattern PAGE_DISTANCE = Pattern.compile(
+            "(上|下|左|右|页眉|页脚)(?:页边距|边距|距边界|距离)?\\s*(?:为|是|[:：])?\\s*(\\d+(?:\\.\\d+)?)\\s*(?:厘米|cm)",
+            Pattern.CASE_INSENSITIVE);
 
     // 工具会管理这些模板样式。缺少任意一个样式时，说明模板不符合当前处理器的假设。
     private static final Set<String> TEMPLATE_STYLE_NAMES = Set.of(
             "论文一级标题", "论文二级标题", "论文三级标题", "论文四级标题", "论文正文",
             "论文图号图名", "论文表格序号及题目", "论文续表", "论文表格后面段落正文", "论文参考文献",
-            "论文封面课题名称", "论文摘要中课题名称", "论文摘要正文", "参考文献及致谢",
+            "论文封面课题名称", "论文摘要中课题名称", "论文摘要正文", "论文表格正文", "参考文献及致谢",
             "toc 1", "toc 2"
     );
 
@@ -97,8 +100,9 @@ public final class WordFormatProcessor {
         requireDocx(sourcePath, "source");
         WordprocessingMLPackage template = WordprocessingMLPackage.load(templatePath.toFile());
         WordprocessingMLPackage source = WordprocessingMLPackage.load(sourcePath.toFile());
-        TemplateRuleExtractor.ensureOperationalStyles(template);
-        ProcessingReport.TemplateRules templateRules = TemplateRuleExtractor.extract(template);
+        String templateMode = TemplateRuleExtractor.detectMode(template);
+        TemplateRuleExtractor.ensureOperationalStyles(template, source);
+        ProcessingReport.TemplateRules templateRules = TemplateRuleExtractor.extract(template, templateMode);
         List<P> paragraphs = directBodyParagraphs(source.getMainDocumentPart());
         DocumentStructure structure = analyzeStructure(source, paragraphs);
         Map<String, Integer> detected = new LinkedHashMap<>();
@@ -115,6 +119,10 @@ public final class WordFormatProcessor {
         List<FormatPlan.Rule> rules = confirmationRules(templateRules);
         List<FormatPlan.Issue> issues = detectStructureIssues(template, source, paragraphs, structure);
         List<String> warnings = new ArrayList<>();
+        warnings.add(templateRules.modeDescription());
+        if ("TEXT_INSTRUCTIONS_ONLY".equals(templateRules.mode())) {
+            warnings.add("文字要求未明确的页面或格式属性会保留待修改文档原值，不会采用要求文档自身的默认版式。");
+        }
         warnings.add("封面采用模板中的同类封面段落和信息表格式，同时保留用户填写的文字。");
         warnings.add("目录保留为 Word 自动目录，并在本机装有 Microsoft Word 时刷新页码和点引导符。");
         warnings.add("公式、浮动文本框和无法可靠匹配的复杂对象只保留，不自动重建。");
@@ -175,9 +183,18 @@ public final class WordFormatProcessor {
         WordprocessingMLPackage target = WordprocessingMLPackage.load(sourcePath.toFile());
 
         // 先从模板命名样式、示例段落和文字说明中生成可执行样式，再同步到目标文档。
-        TemplateRuleExtractor.ensureOperationalStyles(template);
+        String templateMode = TemplateRuleExtractor.detectMode(template);
+        TemplateRuleExtractor.ensureOperationalStyles(template, target);
         P referenceParagraphTemplate = findReferenceParagraphTemplate(template);
         P figureCaptionTemplate = findMatchingParagraph(template, FIGURE_CAPTION);
+        P chineseAbstractTemplate = "TEXT_INSTRUCTIONS_ONLY".equals(templateMode)
+                ? null : findPrefixParagraph(template, "摘要", "摘 要");
+        P englishAbstractTemplate = "TEXT_INSTRUCTIONS_ONLY".equals(templateMode)
+                ? null : findPrefixParagraph(template, "Abstract");
+        P tocLevel1Template = findParagraphByStyleName(template, "toc 1");
+        P tocLevel2Template = findParagraphByStyleName(template, "toc 2");
+        P tableCellTemplate = findTemplateTableCellParagraph(template);
+        P figureContainerTemplate = findTemplateFigureContainerParagraph(template);
         Map<String, String> templateStyleIds = styleIdsByName(template);
         ensureRequiredStyles(templateStyleIds);
 
@@ -185,7 +202,8 @@ public final class WordFormatProcessor {
         Map<String, String> targetStyleIds = styleIdsByName(target);
         ensureRequiredStyles(targetStyleIds);
         SectionResult sectionResult = enabled(enabledRuleKeys, "page")
-                ? synchronizeSectionLayout(template, target)
+                ? synchronizeSectionLayout(template, target, templateMode,
+                        TemplateRuleExtractor.extract(template, templateMode).extractedInstructions())
                 : new SectionResult(0, 0);
 
         MainDocumentPart targetMain = target.getMainDocumentPart();
@@ -245,6 +263,21 @@ public final class WordFormatProcessor {
                 P sample = findPrefixParagraph(template, "Key words", "Keywords");
                 if (sample != null) applyParagraphPropertiesFromSample(sample, paragraph);
             }
+            if (role.equals("abstract-zh") && compact(text).startsWith("摘要") && chineseAbstractTemplate != null) {
+                applyParagraphPropertiesFromSample(chineseAbstractTemplate, paragraph);
+                setFirstLineCharacters(paragraph, 0);
+            }
+            if (role.equals("abstract-en") && compact(text).toLowerCase(Locale.ROOT).startsWith("abstract")
+                    && englishAbstractTemplate != null) {
+                applyParagraphPropertiesFromSample(englishAbstractTemplate, paragraph);
+                setFirstLineCharacters(paragraph, 0);
+            }
+            if (role.equals("toc-level-1") && tocLevel1Template != null) {
+                applyParagraphPropertiesFromSample(tocLevel1Template, paragraph);
+            }
+            if (role.equals("toc-level-2") && tocLevel2Template != null) {
+                applyParagraphPropertiesFromSample(tocLevel2Template, paragraph);
+            }
             if (role.equals("reference-item") && referenceParagraphTemplate != null) {
                 applyParagraphPropertiesFromSample(referenceParagraphTemplate, paragraph);
             }
@@ -260,6 +293,13 @@ public final class WordFormatProcessor {
                 keepFigureWithCaption(targetMain, paragraph);
             } else if (role.equals("table-caption") || role.equals("continued-table-caption")) {
                 setKeepNext(paragraph);
+            }
+            if (role.equals("reference-item")) {
+                String normalizedReference = normalizeReferenceText(text);
+                if (!normalizedReference.equals(text)) {
+                    replaceParagraphText(paragraph, normalizedReference);
+                    text = normalizedReference;
+                }
             }
             modifications.add(new ProcessingReport.Modification(
                     i,
@@ -281,6 +321,12 @@ public final class WordFormatProcessor {
                     detectedRoles,
                     modifications
             );
+            formatFigureContainers(targetMain, figureContainerTemplate, modifications);
+        }
+
+        if (enabled(enabledRuleKeys, "tables")) {
+            String tableCellStyleId = targetStyleIds.get("论文表格正文");
+            formatBodyTables(targetMain, tableCellTemplate, tableCellStyleId, modifications);
         }
 
         requestWordFieldRefresh(target);
@@ -299,17 +345,19 @@ public final class WordFormatProcessor {
         int sections = allSections(targetMain).size();
 
         ProcessingReport result = new ProcessingReport(
-                "Paper Format Modification Tool Core 0.7.0",
+                "Paper Format Modification Tool Core 0.8.0",
                 OffsetDateTime.now(ZoneOffset.UTC).toString(),
                 new ProcessingReport.InputFile(templatePath.toString(), Files.size(templatePath), templateHashBefore),
                 new ProcessingReport.InputFile(sourcePath.toString(), Files.size(sourcePath), sourceHashBefore),
                 new ProcessingReport.OutputFile(outputPath.toString(), Files.size(outputPath), outputHash),
-                TemplateRuleExtractor.extract(template),
+                TemplateRuleExtractor.extract(template, templateMode),
                 new ProcessingReport.DocumentSummary(bodyParagraphs.size(), tables, sections, images, detectedRoles),
                 new ProcessingReport.SectionSummary(
                         sectionResult.inspected(),
                         sectionResult.adjusted(),
-                        "同步模板的页面尺寸、页边距、分栏与文档网格；按摘要、目录和正文分节连续计算页码，保留原页眉页脚。"
+                        "TEXT_INSTRUCTIONS_ONLY".equals(templateMode)
+                                ? "仅应用文字要求中明确给出的纸张和边距参数；未说明的页面属性及原页眉页脚保持不变。"
+                                : "同步模板的页面尺寸、页边距、分栏与文档网格；按摘要、目录和正文分节连续计算页码，保留原页眉页脚。"
                 ),
                 modifications,
                 List.of(
@@ -317,6 +365,7 @@ public final class WordFormatProcessor {
                         "先识别封面、中英文摘要、目录、正文、参考文献、致谢和附录，再按各区域分别应用模板样式。",
                         "封面说明文字、课题名称和封面信息表已按模板对应组件复制格式，同时保留原文内容。",
                         "中文/英文摘要与关键词分别处理，标签和正文保留不同字体、字号与加粗规则。",
+                        "正文表格单元格、图片布局表格和目录条目的直接段落格式已纳入处理。",
                         wordFieldsRefreshed
                                 ? "已调用本机 Microsoft Word 刷新自动目录、页码和域结果。"
                                 : "已标记 Word 在打开文档时刷新自动目录和域结果。",
@@ -349,29 +398,41 @@ public final class WordFormatProcessor {
     private static List<FormatPlan.Rule> confirmationRules(ProcessingReport.TemplateRules rules) {
         Map<String, ProcessingReport.StyleRule> styles = rules.styles();
         List<FormatPlan.Rule> result = new ArrayList<>();
+        boolean textOnly = "TEXT_INSTRUCTIONS_ONLY".equals(rules.mode());
         result.add(new FormatPlan.Rule("page", "页面", "页面尺寸、页边距和分节版式", true,
                 "—", rules.pageSize(), "页边距 " + rules.marginsCm(), "SECTION_PROPERTIES",
-                "模板页面设置", 100));
+                textOnly ? "仅应用文字中明确写出的页面参数，其余保留原文档" : "模板页面设置", textOnly ? 92 : 100));
         result.add(new FormatPlan.Rule("cover", "封面", "封面全部格式", true,
                 "按模板逐组件匹配", "校名、说明书标题、课题名称和信息表分别匹配",
                 "复制对应段落、行距、对齐方式、表格行列与单元格格式；保留用户文字",
-                "MATCHED_COMPONENT", "模板封面中的同位置段落和封面信息表", 96));
+                textOnly ? "SOURCE_STRUCTURE+TEXT_INSTRUCTION" : "MATCHED_COMPONENT",
+                textOnly ? "从待修改文档识别封面组件，只应用文字要求中明确的属性" : "模板封面中的同位置段落和封面信息表",
+                textOnly ? 88 : 96));
+        ProcessingReport.StyleRule abstractRule = styles.get("abstract");
         result.add(new FormatPlan.Rule("abstract-zh", "摘要", "中文题目、摘要与关键词", true,
-                "题目/标签黑体，正文宋体；西文 Times New Roman", "题目 16 pt；标签 14 pt；正文 12 pt",
-                "题目居中；正文两端对齐、固定 24 pt、首行缩进 2 字符；关键词不缩进",
-                "TEXT_INSTRUCTION+MATCHED_SAMPLE", "模板摘要样例及其下方格式说明", 96));
+                textOnly && abstractRule != null ? abstractRule.font() : "题目/标签黑体，正文宋体；西文 Times New Roman",
+                textOnly && abstractRule != null ? abstractRule.size() : "题目 16 pt；标签 14 pt；正文 12 pt",
+                textOnly && abstractRule != null ? abstractRule.paragraphFormatting()
+                        : "题目居中；摘要标签左顶格；后续正文首行缩进 2 字符；关键词不缩进",
+                textOnly ? "SOURCE_STRUCTURE+TEXT_INSTRUCTION" : "TEXT_INSTRUCTION+MATCHED_SAMPLE",
+                textOnly && abstractRule != null ? abstractRule.evidence() : "模板摘要样例及其下方格式说明", textOnly ? 90 : 96));
         result.add(new FormatPlan.Rule("abstract-en", "摘要", "英文题目、Abstract 与 Keywords", true,
-                "Times New Roman", "题目 16 pt；标签 14 pt；正文 12 pt",
-                "题目居中；正文两端对齐、固定 24 pt、首行缩进 2 字符；Keywords 不缩进",
-                "MATCHED_SAMPLE", "模板英文摘要样例；标签和正文按字符范围分别处理", 95));
+                textOnly && abstractRule != null ? abstractRule.font() : "Times New Roman",
+                textOnly && abstractRule != null ? abstractRule.size() : "题目 16 pt；标签 14 pt；正文 12 pt",
+                textOnly && abstractRule != null ? abstractRule.paragraphFormatting()
+                        : "题目居中；Abstract 标签左顶格；后续正文首行缩进 2 字符；Keywords 不缩进",
+                textOnly ? "SOURCE_STRUCTURE+TEXT_INSTRUCTION" : "MATCHED_SAMPLE",
+                textOnly && abstractRule != null ? abstractRule.evidence() : "模板英文摘要样例；标签和正文按字符范围分别处理",
+                textOnly ? 90 : 95));
         result.add(new FormatPlan.Rule("toc", "目录", "Word 自动目录、点引导符与页码", true,
                 "目录标题黑体，条目宋体/Times New Roman", "标题 16 pt；条目 10.5 pt",
                 "保留 TOC 域，只显示一、二级标题；点引导符；页码右对齐；目录标题不进入目录",
                 "WORD_FIELD+NAMED_STYLE", "模板 TOC 域、TOC1/TOC2 样式及目录文字要求", 98));
         addRule(result, styles, "headings", "正文", "一至四级标题", "heading1", 96);
         addRule(result, styles, "body", "正文", "正文段落", "body", 98);
-        addRule(result, styles, "captions", "图表", "表题、续表与表后正文", "tableCaption", 93);
-        addRule(result, styles, "references", "后置部分", "参考文献标题与条目", "references", 96);
+        addRule(result, styles, "captions", "图表", "图题、表题、续表与图片布局", "tableCaption", 93);
+        addRule(result, styles, "tables", "图表", "正文表格单元格", "tableCell", 94);
+        addRule(result, styles, "references", "后置部分", "参考文献标题、条目格式与安全空格规范", "references", 96);
         addRule(result, styles, "thanks", "后置部分", "致谢标题与正文", "thanksBody", 95);
         return result;
     }
@@ -409,6 +470,7 @@ public final class WordFormatProcessor {
             case "toc-title", "toc-level-1", "toc-level-2" -> "toc";
             case "heading-1", "heading-2", "heading-3", "heading-4" -> "headings";
             case "figure-caption", "table-caption", "continued-table-caption", "table-following-body" -> "captions";
+            case "table-cell" -> "tables";
             case "reference-item" -> "references";
             case "thanks-body" -> "thanks";
             case "section-title" -> "references";
@@ -429,10 +491,21 @@ public final class WordFormatProcessor {
             copyParagraphFormatting(templateParagraphs.get(templateMarker),
                     directBodyParagraphs(target.getMainDocumentPart()).get(targetStructure.coverMarker()));
         }
+        List<Tbl> templateTables = allTables(template.getMainDocumentPart());
+        List<Tbl> targetTables = allTables(target.getMainDocumentPart());
         Tbl templateTable = findCoverTable(template.getMainDocumentPart());
         Tbl targetTable = findCoverTable(target.getMainDocumentPart());
         if (templateTable != null && targetTable != null) {
-            copyTableFormatting(templateTable, targetTable);
+            int templateCoverIndex = templateTables.indexOf(templateTable);
+            int targetCoverIndex = targetTables.indexOf(targetTable);
+            int prefixCount = Math.min(templateCoverIndex, targetCoverIndex);
+            // 封面顶部的校徽/校名字样经常放在一个无边框布局表格中；它和信息表都要复制格式。
+            for (int i = 0; i <= prefixCount; i++) {
+                copyTableFormatting(templateTables.get(i), targetTables.get(i));
+            }
+            if (templateCoverIndex != targetCoverIndex) {
+                copyTableFormatting(templateTable, targetTable);
+            }
         }
     }
 
@@ -616,6 +689,144 @@ public final class WordFormatProcessor {
             }
         }
         return null;
+    }
+
+    private static P findParagraphByStyleName(
+            WordprocessingMLPackage document,
+            String expectedStyleName
+    ) throws Docx4JException {
+        for (P paragraph : directBodyParagraphs(document.getMainDocumentPart())) {
+            String styleName = styleNameById(document, getStyleId(paragraph));
+            if (expectedStyleName.equalsIgnoreCase(styleName)) return paragraph;
+        }
+        return null;
+    }
+
+    private static P findTemplateTableCellParagraph(WordprocessingMLPackage template) {
+        Tbl cover = findCoverTable(template.getMainDocumentPart());
+        for (Tbl table : allTables(template.getMainDocumentPart())) {
+            if (table == cover || containsDrawing(table)) continue;
+            List<Tr> rows = childRows(table);
+            if (rows.size() < 2 || childCells(rows.get(0)).size() < 2) continue;
+            for (P paragraph : paragraphsInTable(table)) {
+                if (!normalizeText(TextUtils.getText(paragraph)).isBlank()) return paragraph;
+            }
+        }
+        return null;
+    }
+
+    private static P findTemplateFigureContainerParagraph(WordprocessingMLPackage template) {
+        List<Tbl> tables = allTables(template.getMainDocumentPart());
+        Tbl cover = findCoverTable(template.getMainDocumentPart());
+        int coverIndex = cover == null ? -1 : tables.indexOf(cover);
+        for (int i = coverIndex + 1; i < tables.size(); i++) {
+            for (P paragraph : paragraphsInTable(tables.get(i))) {
+                if (containsDrawing(paragraph)) return paragraph;
+            }
+        }
+        return null;
+    }
+
+    private static void formatFigureContainers(
+            MainDocumentPart main,
+            P sample,
+            List<ProcessingReport.Modification> modifications
+    ) {
+        if (sample == null) return;
+        List<Tbl> tables = allTables(main);
+        Tbl cover = findCoverTable(main);
+        int coverIndex = cover == null ? -1 : tables.indexOf(cover);
+        int reportIndex = -10_000;
+        for (int tableIndex = coverIndex + 1; tableIndex < tables.size(); tableIndex++) {
+            Tbl table = tables.get(tableIndex);
+            boolean changed = false;
+            for (P paragraph : paragraphsInTable(table)) {
+                if (!containsDrawing(paragraph)) continue;
+                applyParagraphPropertiesFromSample(sample, paragraph);
+                applyRunPropertiesFromSample(sample, paragraph);
+                setKeepNext(paragraph);
+                setKeepLines(paragraph);
+                changed = true;
+            }
+            if (changed) {
+                modifications.add(new ProcessingReport.Modification(
+                        reportIndex--, "figure-container", "原图片容器段落格式",
+                        "模板图片容器段落格式", "图片布局表格 " + (tableIndex + 1)));
+            }
+        }
+    }
+
+    private static void formatBodyTables(
+            MainDocumentPart main,
+            P sample,
+            String styleId,
+            List<ProcessingReport.Modification> modifications
+    ) {
+        List<Tbl> tables = allTables(main);
+        Tbl cover = findCoverTable(main);
+        int coverIndex = cover == null ? -1 : tables.indexOf(cover);
+        int reportIndex = -20_000;
+        for (int tableIndex = coverIndex + 1; tableIndex < tables.size(); tableIndex++) {
+            Tbl table = tables.get(tableIndex);
+            if (containsDrawing(table)) continue;
+            List<Tr> rows = childRows(table);
+            if (rows.isEmpty() || childCells(rows.get(0)).size() < 2) continue;
+
+            int formattedParagraphs = 0;
+            for (Tr row : rows) {
+                for (Tc cell : childCells(row)) {
+                    for (P paragraph : childParagraphs(cell)) {
+                        if (normalizeText(TextUtils.getText(paragraph)).isBlank()) continue;
+                        if (styleId != null) applyParagraphStyle(paragraph, styleId);
+                        if (sample != null) {
+                            applyParagraphPropertiesFromSample(sample, paragraph);
+                            applyRunPropertiesFromSample(sample, paragraph);
+                        }
+                        formattedParagraphs++;
+                    }
+                }
+            }
+            if (formattedParagraphs > 0) {
+                modifications.add(new ProcessingReport.Modification(
+                        reportIndex--, "table-cell", "原表格单元格格式",
+                        sample == null ? "文字要求生成的表格正文样式" : "模板表格样例格式",
+                        "表格 " + (tableIndex + 1) + "，处理 " + formattedParagraphs + " 个段落"));
+            }
+        }
+    }
+
+    /**
+     * Applies only high-confidence bibliography whitespace repairs.  It deliberately leaves names,
+     * title wording and punctuation symbols intact; questionable bibliographic content still belongs
+     * in manual review.
+     */
+    private static String normalizeReferenceText(String text) {
+        String value = text.replace('\u00A0', ' ').replaceAll("\\s+", " ").trim();
+        value = value.replaceFirst("^\\s*(\\[?\\d+\\]?[.]?)\\s*", "$1 ");
+
+        int protectedStart = value.length();
+        String lower = value.toLowerCase(Locale.ROOT);
+        for (String marker : List.of("http://", "https://", "doi:")) {
+            int index = lower.indexOf(marker);
+            if (index >= 0) protectedStart = Math.min(protectedStart, index);
+        }
+        String editable = value.substring(0, protectedStart);
+        String protectedTail = value.substring(protectedStart);
+        if (editable.matches(".*[A-Za-z].*")) {
+            editable = editable.replaceAll("(?<=[,;:])(?=[A-Za-z])", " ");
+            editable = editable.replaceAll("(?<=[,;:])(?=[0-9])", " ");
+            editable = editable.replaceAll("(?<=[.])(?=[A-Za-z])", " ");
+            editable = editable.replaceAll("(?<=[a-z])(?=[A-Z])", " ");
+            editable = editable.replaceAll("\\b([A-Z])(?=[A-Z][a-z])", "$1 ");
+            editable = editable.replaceAll("(?<=[A-Z])(?=[A-Z][a-z])", " ");
+            editable = editable.replaceAll("\\b(Boot|Java|Vue|React|System|Platform|Recruitment|Management)and\\b", "$1 and");
+            editable = editable.replaceAll("\\b(js)(for|and|using)\\b", "$1 $2");
+            // Restore common technology names that intentionally contain a lower-to-upper boundary.
+            editable = editable.replace("My SQL", "MySQL").replace("My Batis", "MyBatis")
+                    .replace("Vue. js", "Vue.js");
+            editable = editable.replaceAll(" {2,}", " ");
+        }
+        return (editable + protectedTail).trim();
     }
 
     /** Keep the exact visible spacing used by short template titles such as “致    谢”. */
@@ -1020,14 +1231,14 @@ public final class WordFormatProcessor {
 
         for (Style templateStyle : templateStyles.getStyle()) {
             String templateName = templateStyle.getName() == null ? null : templateStyle.getName().getVal();
-            if (!TEMPLATE_STYLE_NAMES.contains(templateName)) {
+            if (templateName == null || TEMPLATE_STYLE_NAMES.stream().noneMatch(name -> name.equalsIgnoreCase(templateName))) {
                 continue;
             }
             boolean exists = false;
             for (int i = 0; i < targetStyles.getStyle().size(); i++) {
                 Style targetStyle = targetStyles.getStyle().get(i);
                 String targetName = targetStyle.getName() == null ? null : targetStyle.getName().getVal();
-                if (Objects.equals(templateName, targetName)) {
+                if (templateName != null && targetName != null && templateName.equalsIgnoreCase(targetName)) {
                     exists = true;
                     // 深拷贝模板样式，避免同一个 JAXB 对象同时挂到两个文档包中。
                     Style replacement = (Style) XmlUtils.deepCopy(templateStyle);
@@ -1055,7 +1266,15 @@ public final class WordFormatProcessor {
      *
      * <p>页眉页脚关系仍保留目标文档；摘要从 I 开始、目录继续摘要页码、正文从 1 开始。</p>
      */
-    private static SectionResult synchronizeSectionLayout(WordprocessingMLPackage template, WordprocessingMLPackage target) throws Exception {
+    private static SectionResult synchronizeSectionLayout(
+            WordprocessingMLPackage template,
+            WordprocessingMLPackage target,
+            String templateMode,
+            List<String> instructions
+    ) throws Exception {
+        if ("TEXT_INSTRUCTIONS_ONLY".equals(templateMode)) {
+            return applyTextPageRequirements(target, instructions);
+        }
         List<SectPr> templateSections = allSections(template.getMainDocumentPart());
         List<SectPr> targetSections = allSections(target.getMainDocumentPart());
         int inspected = Math.min(templateSections.size(), targetSections.size());
@@ -1094,6 +1313,47 @@ public final class WordFormatProcessor {
             }
         }
         return new SectionResult(inspected, adjusted);
+    }
+
+    /**
+     * A prose-only requirements file is not a layout template.  Only explicitly stated page
+     * measurements are applied; unspecified values remain those of the user's source document.
+     */
+    private static SectionResult applyTextPageRequirements(
+            WordprocessingMLPackage target,
+            List<String> instructions
+    ) {
+        String text = String.join(" ", instructions).replace(" ", "");
+        Map<String, BigInteger> distances = new HashMap<>();
+        Matcher matcher = PAGE_DISTANCE.matcher(text);
+        while (matcher.find()) {
+            double cm = Double.parseDouble(matcher.group(2));
+            distances.put(matcher.group(1), BigInteger.valueOf(Math.round(cm * 1440.0 / 2.54)));
+        }
+        boolean a4 = text.toUpperCase(Locale.ROOT).contains("A4");
+        List<SectPr> sections = allSections(target.getMainDocumentPart());
+        int adjusted = 0;
+        for (SectPr section : sections) {
+            String before = sectionLayoutSignature(section);
+            if (a4) {
+                SectPr.PgSz size = section.getPgSz() == null ? new SectPr.PgSz() : section.getPgSz();
+                size.setW(BigInteger.valueOf(11906));
+                size.setH(BigInteger.valueOf(16838));
+                section.setPgSz(size);
+            }
+            if (!distances.isEmpty()) {
+                SectPr.PgMar margins = section.getPgMar() == null ? new SectPr.PgMar() : section.getPgMar();
+                if (distances.containsKey("上")) margins.setTop(distances.get("上"));
+                if (distances.containsKey("下")) margins.setBottom(distances.get("下"));
+                if (distances.containsKey("左")) margins.setLeft(distances.get("左"));
+                if (distances.containsKey("右")) margins.setRight(distances.get("右"));
+                if (distances.containsKey("页眉")) margins.setHeader(distances.get("页眉"));
+                if (distances.containsKey("页脚")) margins.setFooter(distances.get("页脚"));
+                section.setPgMar(margins);
+            }
+            if (!before.equals(sectionLayoutSignature(section))) adjusted++;
+        }
+        return new SectionResult(sections.size(), adjusted);
     }
 
     /**
@@ -1204,32 +1464,55 @@ public final class WordFormatProcessor {
     private static DocumentStructure analyzeStructure(WordprocessingMLPackage document, List<P> paragraphs) throws Exception {
         int size = paragraphs.size();
         int coverMarker = findFirstCompact(paragraphs, 0, size, "毕业设计说明书");
-        int tocTitle = findFirstCompact(paragraphs, Math.max(0, coverMarker + 1), size, "目录");
+        int searchStart = Math.max(0, coverMarker + 1);
+        int tocTitle = findFirstCompact(paragraphs, searchStart, size, "目录");
+
+        int chineseAbstract = findPrefixCompact(paragraphs, searchStart, tocTitle < 0 ? size : tocTitle,
+                "摘要", "摘要：", "摘要:");
+        int chineseKeywordsHint = findPrefixCompact(paragraphs, Math.max(0, chineseAbstract + 1),
+                tocTitle < 0 ? size : tocTitle, "关键词", "关键词：", "关键词:");
+        int englishAbstractHint = findPrefixCompact(paragraphs, Math.max(0, chineseKeywordsHint + 1),
+                tocTitle < 0 ? size : tocTitle, "Abstract", "Abstract：", "Abstract:");
 
         // 封面题名通常紧跟“毕业设计说明书”，摘要题名通常与封面题名文本相同。
-        int coverTitle = nextNonEmpty(paragraphs, coverMarker + 1, tocTitle < 0 ? size : tocTitle);
+        int coverTitle = nextNonEmpty(paragraphs, searchStart,
+                chineseAbstract >= 0 ? chineseAbstract : (tocTitle < 0 ? size : tocTitle));
         String titleText = coverTitle >= 0 ? normalizeText(TextUtils.getText(paragraphs.get(coverTitle))) : "";
-        int chineseTitle = findSameText(paragraphs, coverTitle + 1, tocTitle < 0 ? size : tocTitle, titleText);
+        int chineseTitle = titleText.isBlank() ? -1
+                : findSameText(paragraphs, coverTitle + 1, tocTitle < 0 ? size : tocTitle, titleText);
         if (chineseTitle < 0) {
             // 文本匹配失败时，用模板样式作为兜底信号。
-            chineseTitle = findStyle(paragraphs, document, coverTitle + 1, tocTitle < 0 ? size : tocTitle, "论文摘要中课题名称");
+            chineseTitle = findStyle(paragraphs, document, Math.max(0, coverTitle + 1),
+                    tocTitle < 0 ? size : tocTitle, "论文摘要中课题名称");
+        }
+        if (chineseTitle < 0 && chineseAbstract >= 0) {
+            chineseTitle = previousNonEmpty(paragraphs, chineseAbstract - 1, Math.max(0, coverTitle + 1));
+        }
+        if (coverTitle < 0 && chineseTitle >= 0) {
+            coverTitle = chineseTitle;
+            titleText = normalizeText(TextUtils.getText(paragraphs.get(chineseTitle)));
         }
 
-        int chineseKeywords = findPrefixCompact(paragraphs, Math.max(0, chineseTitle + 1), tocTitle < 0 ? size : tocTitle, "关键词");
-        int englishAbstract = findPrefixCompact(paragraphs, Math.max(0, chineseKeywords + 1), tocTitle < 0 ? size : tocTitle, "Abstract");
-        int englishTitle = previousNonEmpty(paragraphs, englishAbstract - 1, Math.max(chineseKeywords + 1, 0));
+        int chineseKeywords = chineseKeywordsHint >= 0 ? chineseKeywordsHint
+                : findPrefixCompact(paragraphs, Math.max(0, chineseTitle + 1), tocTitle < 0 ? size : tocTitle, "关键词");
+        int englishAbstract = englishAbstractHint >= 0 ? englishAbstractHint
+                : findPrefixCompact(paragraphs, Math.max(0, chineseKeywords + 1), tocTitle < 0 ? size : tocTitle, "Abstract");
+        int englishTitle = englishAbstract < 0 ? -1
+                : previousNonEmpty(paragraphs, englishAbstract - 1, Math.max(chineseKeywords + 1, 0));
         int englishKeywords = findPrefixCompact(paragraphs, Math.max(0, englishAbstract + 1), tocTitle < 0 ? size : tocTitle, "Keywords", "Keywords：", "Keywords:", "Key words", "Key words：", "Key words:");
 
         // 目录后可能再次出现论文题名，它是正文之前的独立标题，不属于目录条目。
-        int repeatedTitle = findSameText(paragraphs, tocTitle + 1, size, titleText);
-        int mainStart = findNumberedHeading(paragraphs, repeatedTitle >= 0 ? repeatedTitle + 1 : tocTitle + 1, size, false);
+        int afterToc = tocTitle < 0 ? Math.max(0, englishKeywords + 1) : tocTitle + 1;
+        int repeatedTitle = titleText.isBlank() ? -1 : findSameText(paragraphs, afterToc, size, titleText);
+        int mainStart = findNumberedHeading(paragraphs, repeatedTitle >= 0 ? repeatedTitle + 1 : afterToc, size, false);
         if (mainStart < 0) {
-            mainStart = findNumberedHeading(paragraphs, tocTitle + 1, size, true);
+            mainStart = findNumberedHeading(paragraphs, afterToc, size, true);
         }
         if (mainStart < 0) {
             mainStart = size;
         }
-        int tocEnd = repeatedTitle >= 0 && repeatedTitle < mainStart ? repeatedTitle : mainStart;
+        int tocEnd = tocTitle < 0 ? afterToc
+                : (repeatedTitle >= 0 && repeatedTitle < mainStart ? repeatedTitle : mainStart);
 
         int referencesStart = findFirstCompact(paragraphs, mainStart, size, "参考文献");
         if (referencesStart < 0) referencesStart = size;
@@ -1252,14 +1535,16 @@ public final class WordFormatProcessor {
         String compact = text.replace(" ", "");
         if (index == structure.coverTitle()) return "cover-title";
         if (index == structure.chineseTitle() || index == structure.englishTitle() || index == structure.repeatedTitle()) return "thesis-title";
-        if (index > structure.chineseTitle() && index < structure.englishTitle()) {
+        if (structure.chineseTitle() >= 0 && structure.englishTitle() >= 0
+                && index > structure.chineseTitle() && index < structure.englishTitle()) {
             return index == structure.chineseKeywords() ? "keywords-zh" : "abstract-zh";
         }
-        if (index >= structure.englishAbstract() && index < structure.tocTitle()) {
+        if (structure.englishAbstract() >= 0 && index >= structure.englishAbstract()
+                && (structure.tocTitle() < 0 || index < structure.tocTitle())) {
             return index == structure.englishKeywords() ? "keywords-en" : "abstract-en";
         }
         if (index == structure.tocTitle()) return "toc-title";
-        if (index > structure.tocTitle() && index < structure.tocEnd()) {
+        if (structure.tocTitle() >= 0 && index > structure.tocTitle() && index < structure.tocEnd()) {
             return isTocLevel2(text) ? "toc-level-2" : "toc-level-1";
         }
         if (compact.equals("参考文献") || compact.equals("致谢") || compact.equals("附录")) return "section-title";
@@ -1289,7 +1574,8 @@ public final class WordFormatProcessor {
         return switch (role) {
             case "cover-title" -> "论文封面课题名称";
             case "thesis-title" -> "论文摘要中课题名称";
-            case "abstract-zh", "keywords-zh", "abstract-en", "keywords-en" -> "论文正文";
+            case "abstract-zh", "abstract-en" -> "论文摘要正文";
+            case "keywords-zh", "keywords-en" -> "论文正文";
             case "toc-title" -> "参考文献及致谢";
             case "toc-level-1" -> "toc 1";
             case "toc-level-2" -> "toc 2";
@@ -1329,32 +1615,22 @@ public final class WordFormatProcessor {
      */
     private static void applyRoleFormatting(P paragraph, String role) {
         switch (role) {
-            case "body", "thanks-body", "appendix-body" -> {
-                setParagraphFormat(paragraph, JcEnumeration.BOTH, 360, 200);
-                setAllRunFormat(paragraph, "宋体", "Times New Roman", 24, false);
-            }
-            case "reference-item" -> {
-                // 参考文献样式包含模板特有的左缩进和悬挂缩进，不能用通用规则清空。
-                setAllRunFormat(paragraph, "宋体", "Times New Roman", 21, false);
-            }
             case "abstract-zh" -> {
-                setParagraphFormat(paragraph, JcEnumeration.BOTH, 480, 200);
-                setAllRunFormat(paragraph, "宋体", "Times New Roman", 24, false);
+                boolean hasLabel = compact(TextUtils.getText(paragraph)).startsWith("摘要");
+                setFirstLineCharacters(paragraph, hasLabel ? 0 : 200);
                 formatLeadingLabel(paragraph, "摘要", "黑体", "Times New Roman", 28);
             }
             case "keywords-zh" -> {
-                setParagraphFormat(paragraph, JcEnumeration.BOTH, 480, 0);
-                setAllRunFormat(paragraph, "宋体", "Times New Roman", 24, false);
+                setFirstLineCharacters(paragraph, 0);
                 formatLeadingLabel(paragraph, "关键词", "黑体", "Times New Roman", 28);
             }
             case "abstract-en" -> {
-                setParagraphFormat(paragraph, JcEnumeration.BOTH, 480, 200);
-                setAllRunFormat(paragraph, null, "Times New Roman", 24, false);
+                boolean hasLabel = compact(TextUtils.getText(paragraph)).toLowerCase(Locale.ROOT).startsWith("abstract");
+                setFirstLineCharacters(paragraph, hasLabel ? 0 : 200);
                 formatLeadingLabel(paragraph, "Abstract", null, "Times New Roman", 28);
             }
             case "keywords-en" -> {
-                setParagraphFormat(paragraph, JcEnumeration.BOTH, 480, 0);
-                setAllRunFormat(paragraph, null, "Times New Roman", 24, false);
+                setFirstLineCharacters(paragraph, 0);
                 String text = normalizeText(TextUtils.getText(paragraph)).toLowerCase(Locale.ROOT);
                 formatLeadingLabel(paragraph, text.startsWith("key words") ? "Key words" : "Keywords",
                         null, "Times New Roman", 28);
@@ -1367,6 +1643,25 @@ public final class WordFormatProcessor {
                 // Named template style is sufficient for this role.
             }
         }
+    }
+
+    private static void setFirstLineCharacters(P paragraph, int characters) {
+        PPr pPr = paragraph.getPPr();
+        if (pPr == null) {
+            pPr = new PPr();
+            paragraph.setPPr(pPr);
+        }
+        PPrBase.Ind ind = pPr.getInd() == null ? new PPrBase.Ind() : pPr.getInd();
+        ind.setHanging(null);
+        ind.setHangingChars(null);
+        if (characters == 0) {
+            ind.setFirstLine(BigInteger.ZERO);
+            ind.setFirstLineChars(BigInteger.ZERO);
+        } else {
+            ind.setFirstLine(null);
+            ind.setFirstLineChars(BigInteger.valueOf(characters));
+        }
+        pPr.setInd(ind);
     }
 
     private static void setOutlineLevel(P paragraph, int level) {
@@ -1599,7 +1894,9 @@ public final class WordFormatProcessor {
         Map<String, String> result = new LinkedHashMap<>();
         for (Style style : part.getJaxbElement().getStyle()) {
             if (style.getName() != null && style.getName().getVal() != null) {
-                result.put(style.getName().getVal(), style.getStyleId());
+                String name = style.getName().getVal();
+                result.put(name, style.getStyleId());
+                result.putIfAbsent(name.toLowerCase(Locale.ROOT), style.getStyleId());
             }
         }
         return result;
